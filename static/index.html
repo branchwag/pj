@@ -563,7 +563,8 @@
     <!-- Tool confirmation modal -->
     <div class="modal-overlay" id="toolModal">
       <div class="modal">
-        <h3>🔧 AI wants to use tools</h3>
+        <h3>🔧 The agent wants to take these actions</h3>
+        <p style="margin:0.2rem 0 0.6rem;font-size:0.85rem;color:#9ca3af;">Nothing happens until you confirm. Read-only lookups are safe to approve.</p>
         <div id="toolCallsList"></div>
         <div class="modal-buttons">
           <button class="btn-deny" id="denyBtn">Deny</button>
@@ -806,13 +807,13 @@
 
       function describeToolCall(tc) {
         const args = tc.function.arguments || {};
-        if (tc.function.name === "write_file") return "Write " + (args.path || "?") + " (" + ((args.content || "").length) + " bytes)";
-        if (tc.function.name === "edit_file") return "Edit " + (args.path || "?");
-        if (tc.function.name === "read_file") return "Read " + (args.path || "?");
-        if (tc.function.name === "run_command") return "Run: " + (args.command || "?");
-        if (tc.function.name === "glob") return "Glob: " + (args.pattern || "?");
-        if (tc.function.name === "grep") return "Grep '" + (args.pattern || "?") + "' in " + (args.path || ".");
-        if (tc.function.name === "read_directory") return "List " + (args.path || "?");
+        if (tc.function.name === "write_file") return "Overwrite or create the file " + (args.path || "?") + " with new content (" + ((args.content || "").length) + " bytes)";
+        if (tc.function.name === "edit_file") return "Edit " + (args.path || "?") + ": replace a unique snippet of text";
+        if (tc.function.name === "read_file") return "Read the file " + (args.path || "?") + " (read-only)";
+        if (tc.function.name === "run_command") return "Run this command in the project directory: " + (args.command || "?");
+        if (tc.function.name === "glob") return "List file names matching \"" + (args.pattern || "?") + "\" — just finds files, reads nothing, changes nothing (read-only)";
+        if (tc.function.name === "grep") return "Search inside files for '" + (args.pattern || "?") + "' under " + (args.path || ".") + " (read-only)";
+        if (tc.function.name === "read_directory") return "List what is inside the directory " + (args.path || "?") + " (read-only)";
         return tc.function.name;
       }
 
@@ -1182,7 +1183,16 @@
 
           const nameDiv = document.createElement("div");
           nameDiv.className = "tool-call-name";
-          nameDiv.textContent = tc.function.name;
+          const toolLabels = {
+            glob: "glob — find files by name pattern",
+            grep: "grep — search inside files",
+            read_file: "read_file — view a file",
+            read_directory: "read_directory — list a folder",
+            write_file: "write_file — create/overwrite a file",
+            edit_file: "edit_file — modify a file",
+            run_command: "run_command — execute a shell command",
+          };
+          nameDiv.textContent = toolLabels[tc.function.name] || tc.function.name;
 
           const detailDiv = document.createElement("div");
           detailDiv.className = "tool-call-detail";
