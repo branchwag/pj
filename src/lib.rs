@@ -246,6 +246,8 @@ pub struct ChatSummary {
     pub title: String,
     pub created_at: String,
     pub message_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -298,6 +300,7 @@ pub fn init_db(pool: &DbPool) {
         [],
     );
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT DEFAULT NULL", []);
+    let _ = conn.execute("ALTER TABLE chats ADD COLUMN workdir TEXT DEFAULT NULL", []);
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pending_tools (
             chat_id INTEGER PRIMARY KEY,
@@ -312,7 +315,7 @@ pub fn list_chats(pool: &DbPool) -> Result<Vec<ChatSummary>, String> {
     let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
     let mut stmt = conn
         .prepare(
-            "SELECT c.id, c.title, c.created_at, COUNT(m.id) as message_count
+            "SELECT c.id, c.title, c.created_at, COUNT(m.id) as message_count, c.workdir
              FROM chats c
              LEFT JOIN messages m ON m.chat_id = c.id
              GROUP BY c.id
@@ -326,6 +329,7 @@ pub fn list_chats(pool: &DbPool) -> Result<Vec<ChatSummary>, String> {
                 title: row.get(1)?,
                 created_at: row.get(2)?,
                 message_count: row.get(3)?,
+                workdir: row.get(4)?,
             })
         })
         .map_err(|e| format!("{e}"))?;
@@ -342,7 +346,7 @@ pub fn create_chat(pool: &DbPool) -> Result<ChatSummary, String> {
         .map_err(|e| format!("{e}"))?;
     let id = conn.last_insert_rowid();
     let mut stmt = conn
-        .prepare("SELECT id, title, created_at FROM chats WHERE id = ?1")
+        .prepare("SELECT id, title, created_at, workdir FROM chats WHERE id = ?1")
         .map_err(|e| format!("{e}"))?;
     let chat = stmt
         .query_row(params![id], |row| {
@@ -351,10 +355,30 @@ pub fn create_chat(pool: &DbPool) -> Result<ChatSummary, String> {
                 title: row.get(1)?,
                 created_at: row.get(2)?,
                 message_count: 0,
+                workdir: row.get(3)?,
             })
         })
         .map_err(|e| format!("{e}"))?;
     Ok(chat)
+}
+
+pub fn get_chat_workdir(pool: &DbPool, id: i64) -> Result<Option<String>, String> {
+    let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    let workdir: Option<String> = conn
+        .query_row("SELECT workdir FROM chats WHERE id = ?1", params![id], |r| r.get(0))
+        .map_err(|e| format!("{e}"))?;
+    Ok(workdir
+        .filter(|w| !w.trim().is_empty()))
+}
+
+pub fn set_chat_workdir(pool: &DbPool, id: i64, workdir: Option<&str>) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    conn.execute(
+        "UPDATE chats SET workdir = ?1 WHERE id = ?2",
+        params![workdir.map(str::trim).filter(|w| !w.is_empty()), id],
+    )
+    .map_err(|e| format!("{e}"))?;
+    Ok(())
 }
 
 pub fn chat_exists(pool: &DbPool, id: i64) -> Result<bool, String> {
@@ -603,17 +627,30 @@ pub fn get_coding_system_prompt() -> String {
     - Prefer edit_file with a unique old_string for targeted changes; use write_file only for new files or full rewrites.\n\
     - After code changes, verify with run_command (build/test) when it makes sense.\n\
     - Chain multiple tool calls autonomously to finish the task; execution is already gated by the UI, so never ask the user for permission between steps.\n\
+    - If a project directory is specified below, create and modify files there. If none is set and it is unclear where a new file belongs, briefly ask the user where to put it before creating anything.\n\
     - Keep prose short: report what you did, what changed, and anything the user must decide. No filler.\n\
     If you cannot use tools for something, say so plainly."
         .to_string()
 }
 
+fn chat_system_prompt(workdir: Option<&str>) -> String {
+    match workdir {
+        Some(dir) => format!(
+            "{}\n\nProject directory for this conversation: {dir}. \
+             Create and edit files there unless the user explicitly says otherwise.",
+            get_coding_system_prompt()
+        ),
+        None => get_coding_system_prompt(),
+    }
+}
+
 pub fn build_messages_from_db(pool: &DbPool, chat_id: i64) -> Result<Vec<OllamaChatMessage>, String> {
+    let workdir = get_chat_workdir(pool, chat_id)?;
     let db_msgs = get_messages(pool, chat_id)?;
     let mut messages = Vec::new();
     messages.push(OllamaChatMessage {
         role: "system".to_string(),
-        content: get_coding_system_prompt(),
+        content: chat_system_prompt(workdir.as_deref()),
         tool_calls: None,
         name: None,
         images: None,
@@ -773,11 +810,16 @@ pub async fn run_chat_turn(
 
     let native_tcs = resp.message.tool_calls.clone().unwrap_or_default();
     let clean_text = tools::strip_tool_calls_from_text(&resp.message.content);
-    let tool_calls = tools::normalize_tool_calls(&(if !native_tcs.is_empty() {
-        native_tcs
-    } else {
-        tools::parse_tool_calls_from_text(&resp.message.content)
-    }));
+    let workdir = get_chat_workdir(pool, chat_id)?;
+    let base = workdir.as_deref().map(std::path::Path::new);
+    let tool_calls = tools::normalize_tool_calls_in(
+        &(if !native_tcs.is_empty() {
+            native_tcs
+        } else {
+            tools::parse_tool_calls_from_text(&resp.message.content)
+        }),
+        base,
+    );
 
     if tool_calls.is_empty() && clean_text.trim().is_empty() {
         publish_chat_change(&ChatChange::Upsert { id: chat_id }).ok();
@@ -822,10 +864,12 @@ pub async fn resolve_pending_tools(
         format!("No pending tool calls for chat {chat_id} (already resolved elsewhere?)")
     })?;
     delete_pending_tools(pool, chat_id)?;
+    let workdir = get_chat_workdir(pool, chat_id)?;
+    let base = workdir.as_deref().map(std::path::Path::new);
 
     for tc in &calls {
         let result = if approved {
-            match tools::execute_tool(tc) {
+            match tools::execute_tool_with_base(tc, base) {
                 Ok(r) => r,
                 Err(e) => format!("Error: {e}"),
             }

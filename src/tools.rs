@@ -42,14 +42,14 @@ fn truncate_output(output: &str) -> String {
     )
 }
 
-fn absolute_path(path: &str) -> String {
+fn absolute_path_in(path: &str, base: Option<&Path>) -> String {
     let p = Path::new(path);
     if p.is_absolute() {
         p.to_string_lossy().to_string()
     } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
-            Err(_) => p.to_string_lossy().to_string(),
+        match base.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()) {
+            Some(cwd) => cwd.join(p).to_string_lossy().to_string(),
+            None => p.to_string_lossy().to_string(),
         }
     }
 }
@@ -60,7 +60,7 @@ fn cwd_display() -> String {
         .unwrap_or_else(|_| ".".to_string())
 }
 
-pub fn normalize_tool_call(tool_call: &ToolCall) -> ToolCall {
+pub fn normalize_tool_call_in(tool_call: &ToolCall, base: Option<&Path>) -> ToolCall {
     let mut normalized = tool_call.clone();
     let name = normalized.function.name.as_str();
     if !matches!(name, "write_file" | "edit_file" | "read_file" | "read_directory") {
@@ -74,7 +74,7 @@ pub fn normalize_tool_call(tool_call: &ToolCall) -> ToolCall {
         if !trimmed.is_empty() {
             args.insert(
                 "path".to_string(),
-                serde_json::Value::String(absolute_path(trimmed)),
+                serde_json::Value::String(absolute_path_in(trimmed, base)),
             );
         }
     }
@@ -82,8 +82,12 @@ pub fn normalize_tool_call(tool_call: &ToolCall) -> ToolCall {
     normalized
 }
 
-pub fn normalize_tool_calls(tool_calls: &[ToolCall]) -> Vec<ToolCall> {
-    tool_calls.iter().map(normalize_tool_call).collect()
+pub fn normalize_tool_call(tool_call: &ToolCall) -> ToolCall {
+    normalize_tool_call_in(tool_call, None)
+}
+
+pub fn normalize_tool_calls_in(tool_calls: &[ToolCall], base: Option<&Path>) -> Vec<ToolCall> {
+    tool_calls.iter().map(|tc| normalize_tool_call_in(tc, base)).collect()
 }
 
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
@@ -200,6 +204,10 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
 }
 
 pub fn execute_tool(tool_call: &ToolCall) -> Result<String, String> {
+    execute_tool_with_base(tool_call, None)
+}
+
+pub fn execute_tool_with_base(tool_call: &ToolCall, base: Option<&Path>) -> Result<String, String> {
     let name = &tool_call.function.name;
     let args = &tool_call.function.arguments;
 
@@ -297,11 +305,16 @@ pub fn execute_tool(tool_call: &ToolCall) -> Result<String, String> {
                 .map(|v| v.clamp(1, 600))
                 .unwrap_or(120);
             let start = std::time::Instant::now();
-            let mut child = std::process::Command::new("sh")
+            let mut command = std::process::Command::new("sh");
+            command
                 .arg("-c")
                 .arg(cmd)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if let Some(dir) = base {
+                command.current_dir(dir);
+            }
+            let mut child = command
                 .spawn()
                 .map_err(|e| format!("run_command spawn error: {e}"))?;
 
@@ -373,15 +386,19 @@ pub fn execute_tool(tool_call: &ToolCall) -> Result<String, String> {
         }
         "glob" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).ok_or("missing pattern")?;
-            let base = args
+            let root = args
                 .get("path")
                 .and_then(|v| v.as_str())
-                .map(absolute_path)
-                .unwrap_or_else(cwd_display);
+                .map(|p| absolute_path_in(p, base))
+                .unwrap_or_else(|| {
+                    base.map(Path::to_string_lossy)
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(cwd_display)
+                });
             let full_pattern = if Path::new(pattern).is_absolute() {
                 pattern.to_string()
             } else {
-                format!("{}/{}", base.trim_end_matches('/'), pattern)
+                format!("{}/{}", root.trim_end_matches('/'), pattern)
             };
             let entries = glob::glob(&full_pattern).map_err(|e| format!("glob error: {e}"))?;
             let mut paths: Vec<(std::time::SystemTime, String)> = entries
@@ -413,8 +430,12 @@ pub fn execute_tool(tool_call: &ToolCall) -> Result<String, String> {
             let search_path = args
                 .get("path")
                 .and_then(|v| v.as_str())
-                .map(absolute_path)
-                .unwrap_or_else(cwd_display);
+                .map(|p| absolute_path_in(p, base))
+                .unwrap_or_else(|| {
+                    base.map(Path::to_string_lossy)
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(cwd_display)
+                });
             let include = args.get("include").and_then(|v| v.as_str());
 
             let mut rg_result = std::process::Command::new("rg");
@@ -446,7 +467,7 @@ pub fn execute_tool(tool_call: &ToolCall) -> Result<String, String> {
         }
         "read_directory" => {
             let dir = args.get("path").and_then(|v| v.as_str()).ok_or("missing path")?;
-            let dir_abs = absolute_path(dir);
+            let dir_abs = absolute_path_in(dir, base);
             let entries = std::fs::read_dir(&dir_abs).map_err(|e| format!("read_dir error: {e}"))?;
             let mut items: Vec<String> = entries
                 .filter_map(|e| e.ok())

@@ -53,6 +53,7 @@ data/       — SQLite database (chat.db)
   - `POST /api/chat/tools` — chat with tool support
   - `POST /api/chat/tools/confirm` — approve/deny pending tools for a chat (`{chat_id, approved}`)
   - `GET /api/chats/{id}/pending-tools` — fetch a chat's pending tool calls (used to show approval prompts initiated from another surface)
+  - `PUT /api/chats/{id}/workdir` — set the chat's project directory (`{workdir: "/abs/path"}` or null); must be an existing absolute path
   - `GET /api/events` — server-sent events for chat change sync
   - `POST /api/write-file` — direct web save helper for code blocks
   - CRUD for chats/messages
@@ -65,7 +66,11 @@ All tool flows (web and CLI) go through the same engine functions in `lib.rs`:
 - `run_chat_turn(pool, url, model, chat_id)` — rebuilds context from the DB, calls the model, persists the assistant reply or tool call, and stores unapproved tool calls in the `pending_tools` table. Returns `TurnOutcome::Reply(text)` or `TurnOutcome::PendingTools(calls)`.
 - `resolve_pending_tools(..., approved)` — executes (or declines) a chat's pending tools, persists each result as a `role='tool'` message, deletes the pending row, and immediately runs the next turn.
 
-Because pending approvals live in the database (not memory), either surface can approve work requested by the other. Chat change events (`ChatChange::Upsert/Activity`) keep both surfaces live.
+Because pending approvals live in the database (not memory), either surface can approve work requested by the other. Chat change events (`ChatChange::Upsert/Activity`) keep both surfaces live. Every turn publishes an `Activity::Idle` event when it finishes with text, so no surface is left showing "thinking".
+
+### Per-chat working directory
+
+Chats have an optional `workdir`. When set, the engine resolves relative tool paths against it, runs `run_command` inside it, and appends it to the system prompt so the model creates files in the user's project instead of pj's own directory. When unset, behavior falls back to the process working directory. Tool execution enforces this in Rust (`execute_tool_with_base`, `normalize_tool_calls_in`); the prompt only tells the model where to put things.
 
 ### Ollama Integration
 
@@ -100,7 +105,7 @@ Similarly, no image/vision limitations should be hardcoded in the system prompt 
 ### Database
 
 SQLite via r2d2 connection pool. Schema:
-- `chats` — id, title, created_at
+- `chats` — id, title, created_at, workdir (optional per-chat project directory)
 - `messages` — id, chat_id, role, content, created_at, images, tool_calls (JSON for assistant messages that request tools), name (tool name on `role='tool'` rows)
 - `pending_tools` — chat_id (PK), tool_calls JSON; one unapproved batch per chat
 

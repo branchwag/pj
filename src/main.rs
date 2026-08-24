@@ -49,6 +49,37 @@ async fn handle_delete_chat(
     Ok(HttpResponse::Ok().json(serde_json::json!({"ok": true})))
 }
 
+#[derive(Deserialize)]
+struct WorkdirRequest {
+    workdir: Option<String>,
+}
+
+async fn handle_set_workdir(
+    path: web::Path<i64>,
+    req: web::Json<WorkdirRequest>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse> {
+    let chat_id = path.into_inner();
+    if let Some(dir) = req.workdir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        let p = std::path::Path::new(dir);
+        if !p.is_absolute() {
+            return Ok(HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": "workdir must be an absolute path"})));
+        }
+        if !p.is_dir() {
+            return Ok(HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": format!("directory does not exist: {dir}")})));
+        }
+    }
+    let pool = pool.get_ref().clone();
+    let dir = req.workdir.clone();
+    web::block(move || set_chat_workdir(&pool, chat_id, dir.as_deref()))
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({"ok": true, "workdir": req.workdir})))
+}
+
 async fn handle_get_messages(path: web::Path<i64>, pool: web::Data<DbPool>) -> Result<HttpResponse> {
     let id = path.into_inner();
     let pool = pool.get_ref().clone();
@@ -470,6 +501,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/chats", web::get().to(handle_list_chats))
             .route("/api/chats/{id}", web::delete().to(handle_delete_chat))
             .route("/api/chats/{id}/messages", web::get().to(handle_get_messages))
+            .route("/api/chats/{id}/workdir", web::put().to(handle_set_workdir))
             .route("/api/chats/{id}/pending-tools", web::get().to(handle_get_pending_tools))
             .route("/api/events", web::get().to(handle_events))
             .route("/api/write-file", web::post().to(handle_write_file))

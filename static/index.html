@@ -539,7 +539,15 @@
         <div class="chat-header-left">
           <span>pj</span>
         </div>
-
+        <input
+          type="text"
+          id="workdirInput"
+          placeholder="Folder for new files (e.g. /home/you/project)"
+          autocomplete="off"
+          spellcheck="false"
+          style="flex:1;margin-left:1rem;max-width:420px;padding:0.35rem 0.6rem;font-size:0.85rem;border:1px solid #3f3f46;border-radius:6px;background:#18181b;color:#d4d4d8;"
+          title="Where the agent creates and edits files for this chat. Leave empty to use pj's own directory."
+        />
       </div>
       <div class="chat-container" id="chatContainer">
         <div class="empty-state" id="emptyState">Select a chat or create a new one</div>
@@ -590,9 +598,11 @@
       let loadingChatId = null;
       let activeChatId = null;
       let chats = [];
-
       let pendingToolCalls = [];
+
       let pendingChatId = null;
+
+      const filesWrittenByTools = new Set();
       let sharedActivityByChat = {};
       let chatEventSource = null;
       let lastChatEventAt = 0;
@@ -696,6 +706,12 @@
         return blocks;
       }
 
+      function suggestSavePath(ext) {
+        const chat = chats.find((c) => c.id === activeChatId);
+        if (chat && chat.workdir) return chat.workdir.replace(/\/+$/, "") + "/script." + ext;
+        return "/tmp/script." + ext;
+      }
+
       async function saveCodeBlock(code, filename) {
         try {
           const res = await fetch("/api/write-file", {
@@ -759,12 +775,15 @@
           for (const block of blocks) {
             if (!block.code.trim()) continue;
             const lang = block.language || "script";
+            const extMap = { python: "py", javascript: "js", typescript: "ts", bash: "sh", shell: "sh", ruby: "rb", go: "go", golang: "go", rust: "rs", "c++": "cpp" };
+            const ext = extMap[block.language] || block.language || "sh";
+            const alreadyWritten = [...filesWrittenByTools].some((p) => p.toLowerCase().endsWith("." + String(ext).toLowerCase()));
+            if (alreadyWritten) continue;
             const btn = document.createElement("button");
             btn.className = "save-btn";
             btn.textContent = "Save " + lang;
             btn.addEventListener("click", async () => {
-              const ext = { python: "py", javascript: "js", bash: "sh", ruby: "rb", go: "go", rust: "rs" }[block.language] || block.language || "sh";
-              const name = prompt("Save as:", "/tmp/script." + ext);
+              const name = prompt("Save as:", suggestSavePath(ext));
               if (!name) return;
               btn.textContent = "Saving...";
               btn.disabled = true;
@@ -835,6 +854,7 @@
         const res = await fetch("/api/chats/" + id + "/messages", { cache: "no-store" });
         const messages = await res.json();
         chatContainer.innerHTML = "";
+        filesWrittenByTools.clear();
         for (const msg of messages) {
           if (msg.role === "tool") {
             const div = document.createElement("div");
@@ -842,6 +862,13 @@
             div.textContent = "  [" + (msg.name || "tool") + "] " + (msg.content || "").split("\n")[0].substring(0, 160);
             chatContainer.appendChild(div);
           } else {
+            if (msg.tool_calls) {
+              for (const tc of msg.tool_calls) {
+                if (tc.function.name === "write_file" && tc.function.arguments && tc.function.arguments.path) {
+                  filesWrittenByTools.add(tc.function.arguments.path);
+                }
+              }
+            }
             addMessage(msg.content, msg.role, msg.images);
             if (msg.tool_calls) {
               for (const tc of msg.tool_calls) {
@@ -1002,6 +1029,8 @@
         renderChatList();
         chatContainer.innerHTML = "";
         syncComposerState();
+        const chat = chats.find((c) => c.id === id);
+        workdirInput.value = (chat && chat.workdir) || "";
         messageInput.focus();
 
         try {
@@ -1328,6 +1357,13 @@
           if (activeChatId === requestChatId) {
             document.getElementById("loadingMessage")?.remove();
           }
+          if (response.ok && pendingToolCalls.length > 0) {
+            for (const tc of pendingToolCalls) {
+              if (tc.function.name === "write_file" && tc.function.arguments && tc.function.arguments.path) {
+                filesWrittenByTools.add(tc.function.arguments.path);
+              }
+            }
+          }
           pendingToolCalls = [];
           pendingChatId = null;
 
@@ -1422,6 +1458,34 @@
       });
       confirmBtn.addEventListener("click", handleToolConfirm);
       denyBtn.addEventListener("click", handleToolDeny);
+
+      const workdirInput = document.getElementById("workdirInput");
+      async function saveWorkdir() {
+        if (!activeChatId) return;
+        const value = workdirInput.value.trim();
+        try {
+          const res = await fetch("/api/chats/" + activeChatId + "/workdir", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workdir: value || null }),
+          });
+          if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            alert("Could not set folder: " + (data.error || res.status));
+            return;
+          }
+          const chat = chats.find((c) => c.id === activeChatId);
+          if (chat) chat.workdir = value || undefined;
+          workdirInput.style.borderColor = "#22c55e";
+          setTimeout(() => (workdirInput.style.borderColor = ""), 1200);
+        } catch (e) {
+          alert("Could not set folder: " + e.message);
+        }
+      }
+      workdirInput.addEventListener("change", saveWorkdir);
+      workdirInput.addEventListener("keypress", (e) => {
+        if (e.key === "Enter") workdirInput.blur();
+      });
 
       const attachBtn = document.getElementById("attachBtn");
       const imageFileInput = document.getElementById("imageFileInput");
