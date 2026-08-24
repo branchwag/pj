@@ -780,12 +780,23 @@ pub async fn run_chat_turn(
     }));
 
     if tool_calls.is_empty() && clean_text.trim().is_empty() {
+        publish_chat_change(&ChatChange::Upsert { id: chat_id }).ok();
+        publish_chat_change(&ChatChange::Activity {
+            id: chat_id,
+            state: ChatActivityState::Idle,
+        })
+        .ok();
         return Ok(TurnOutcome::Reply(String::new()));
     }
 
     if tool_calls.is_empty() {
         add_message(pool, chat_id, "assistant", &clean_text, None)?;
         publish_chat_change(&ChatChange::Upsert { id: chat_id }).ok();
+        publish_chat_change(&ChatChange::Activity {
+            id: chat_id,
+            state: ChatActivityState::Idle,
+        })
+        .ok();
         return Ok(TurnOutcome::Reply(clean_text));
     }
 
