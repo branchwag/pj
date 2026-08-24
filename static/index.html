@@ -411,6 +411,23 @@
         cursor: default;
       }
 
+      .code-block-wrap {
+        position: relative;
+      }
+
+      .code-block-wrap .save-btn {
+        position: absolute;
+        top: 0.4rem;
+        right: 0.4rem;
+        margin-top: 0;
+        z-index: 1;
+        opacity: 0.85;
+      }
+
+      .code-block-wrap .save-btn:hover {
+        opacity: 1;
+      }
+
       .message pre {
         background-color: #111;
         border: 1px solid #333;
@@ -708,7 +725,8 @@
       let pendingChatId = null;
 
       const filesWrittenByTools = new Set();
-      let sharedActivityByChat = {};
+      const sharedActivityByChat = {};
+      const lastAssistantAtByChat = {};
       let chatEventSource = null;
       let lastChatEventAt = 0;
       let lastChatRefreshAt = 0;
@@ -722,10 +740,17 @@
       const CHAT_REMOTE_ACTIVITY_POLL_MS = 4000;
       const CHAT_VISIBLE_STALE_POLL_MS = 30000;
       const CHAT_REFRESH_COOLDOWN_MS = 2000;
+      const ACTIVITY_STALE_MS = 600000;
 
       function getSharedActivityState(chatId) {
         if (chatId === null || chatId === undefined) return "idle";
-        return sharedActivityByChat[chatId] || "idle";
+        const entry = sharedActivityByChat[chatId];
+        if (!entry) return "idle";
+        if (Date.now() - entry.at > ACTIVITY_STALE_MS) {
+          delete sharedActivityByChat[chatId];
+          return "idle";
+        }
+        return entry.state;
       }
 
       function getActiveChatActivityState() {
@@ -924,6 +949,7 @@
         }
 
         const codeBlockRe = /```(\w*)\n([\s\S]*?)```/g;
+        const codePres = [];
         let lastIndex = 0;
         let match;
         while ((match = codeBlockRe.exec(content)) !== null) {
@@ -938,6 +964,7 @@
           codeEl.textContent = code;
           pre.appendChild(codeEl);
           messageDiv.appendChild(pre);
+          codePres.push(pre);
           lastIndex = match.index + match[0].length;
         }
         if (lastIndex < content.length) {
@@ -950,14 +977,21 @@
         chatContainer.appendChild(messageDiv);
 
         if (role === "assistant") {
+          lastAssistantAtByChat[activeChatId] = Date.now();
           const blocks = extractCodeBlocks(content);
+          let preIndex = 0;
           for (const block of blocks) {
-            if (!block.code.trim()) continue;
+            const preEl = codePres[preIndex++];
+            if (!block.code.trim() || !preEl) continue;
             const lang = block.language || "script";
             const extMap = { python: "py", javascript: "js", typescript: "ts", bash: "sh", shell: "sh", ruby: "rb", go: "go", golang: "go", rust: "rs", "c++": "cpp" };
             const ext = extMap[block.language] || block.language || "sh";
             const alreadyWritten = [...filesWrittenByTools].some((p) => p.toLowerCase().endsWith("." + String(ext).toLowerCase()));
             if (alreadyWritten) continue;
+            const wrap = document.createElement("div");
+            wrap.className = "code-block-wrap";
+            preEl.replaceWith(wrap);
+            wrap.appendChild(preEl);
             const btn = document.createElement("button");
             btn.className = "save-btn";
             btn.textContent = "Save " + lang;
@@ -971,7 +1005,7 @@
               if (result.startsWith("Saved")) btn.classList.add("saved");
               btn.disabled = false;
             });
-            chatContainer.appendChild(btn);
+            wrap.appendChild(btn);
           }
         }
 
@@ -993,6 +1027,18 @@
       }
 
       function renderSharedActivity() {
+        const sharedEntry =
+          activeChatId !== null && activeChatId !== undefined
+            ? sharedActivityByChat[activeChatId]
+            : null;
+        const lastAssistantAt = lastAssistantAtByChat[activeChatId] || 0;
+        if (
+          sharedEntry &&
+          sharedEntry.state === "thinking" &&
+          sharedEntry.at <= lastAssistantAt
+        ) {
+          delete sharedActivityByChat[activeChatId];
+        }
         const activity = getActiveChatActivityState();
         if (activity === "thinking") {
           addLoadingMessage("Thinking...");
@@ -1035,6 +1081,12 @@
         chatContainer.innerHTML = "";
         filesWrittenByTools.clear();
         for (const msg of messages) {
+          if (msg.role === "assistant") {
+            const t = new Date(msg.created_at + "Z").getTime();
+            if (!Number.isNaN(t)) {
+              lastAssistantAtByChat[id] = Math.max(lastAssistantAtByChat[id] || 0, t);
+            }
+          }
           if (msg.role === "tool") {
             const div = document.createElement("div");
             div.className = "message tool";
@@ -1146,7 +1198,15 @@
             return;
           }
           if (activeChatId !== null && chats.some((c) => c.id === activeChatId)) {
-            renderSharedActivity();
+            if (sharedActivityByChat[activeChatId] && !isLoading) {
+              try {
+                await renderMessagesForChat(activeChatId);
+              } catch (e) {
+                renderSharedActivity();
+              }
+            } else {
+              renderSharedActivity();
+            }
           }
         })();
 
@@ -1293,9 +1353,9 @@
                   pendingChatId = null;
                 }
               } else if (state === "Thinking") {
-                sharedActivityByChat[chatId] = "thinking";
+                sharedActivityByChat[chatId] = { state: "thinking", at: Date.now() };
               } else if (state === "AwaitingToolConfirmation") {
-                sharedActivityByChat[chatId] = "awaiting_tool_confirmation";
+                sharedActivityByChat[chatId] = { state: "awaiting_tool_confirmation", at: Date.now() };
                 if (activeChatId === chatId && pendingToolCalls.length === 0) {
                   await fetchAndShowPendingTools(chatId);
                 }

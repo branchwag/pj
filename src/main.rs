@@ -262,6 +262,7 @@ fn ensure_chat(pool: &DbPool, chat_id: Option<i64>, first_message: &str) -> Resu
         Some(id) => {
             let exists = chat_exists(pool, id).map_err(actix_web::error::ErrorInternalServerError)?;
             if exists {
+                let _ = update_title_from_message(pool, id, first_message);
                 Ok(id)
             } else {
                 Err(actix_web::error::ErrorBadRequest(format!(
