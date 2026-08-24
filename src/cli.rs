@@ -64,10 +64,8 @@ enum CliEvent {
     TextReady {
         chat_id: i64,
     },
-    ToolCalls {
+    ToolCallsPending {
         chat_id: i64,
-        tool_calls: Vec<ToolCall>,
-        messages: Vec<OllamaChatMessage>,
     },
     Error {
         chat_id: i64,
@@ -92,7 +90,7 @@ struct App {
     model: String,
     tx: mpsc::UnboundedSender<CliEvent>,
     rx: mpsc::UnboundedReceiver<CliEvent>,
-    pending_tool_calls: Option<(i64, Vec<ToolCall>, Vec<OllamaChatMessage>)>,
+    pending_tool_calls: Option<(i64, Vec<ToolCall>)>,
     waiting_confirmation: bool,
     event_client: Option<EventClient>,
 }
@@ -143,6 +141,21 @@ impl App {
         self.scroll = 0;
     }
 
+    fn refresh_pending_for_active_chat(&mut self) {
+        let already_shown = matches!(
+            self.pending_tool_calls,
+            Some((chat_id, _)) if Some(chat_id) == self.active_chat_id
+        );
+        if !already_shown
+            && let Some(chat_id) = self.active_chat_id
+            && let Ok(Some(calls)) = load_pending_tools(&self.pool, chat_id)
+        {
+            self.pending_tool_calls = Some((chat_id, calls));
+            self.confirmation_scroll = 0;
+            self.waiting_confirmation = true;
+        }
+    }
+
     fn is_active_chat_loading(&self) -> bool {
         self.loading && self.loading_chat_id == self.active_chat_id
     }
@@ -150,13 +163,13 @@ impl App {
     fn has_pending_confirmation_for_active_chat(&self) -> bool {
         matches!(
             self.pending_tool_calls,
-            Some((chat_id, _, _)) if Some(chat_id) == self.active_chat_id
+            Some((chat_id, _)) if Some(chat_id) == self.active_chat_id
         )
     }
 
     fn confirmation_line_count(&self) -> usize {
         match &self.pending_tool_calls {
-            Some((_, tool_calls, _)) => tool_calls
+            Some((_, tool_calls)) => tool_calls
                 .iter()
                 .map(|tc| tools::tool_call_description(tc).lines().count() + 1)
                 .sum(),
@@ -168,6 +181,7 @@ impl App {
         if index < self.chats.len() {
             self.active_chat_id = Some(self.chats[index].id);
             self.load_messages();
+            self.refresh_pending_for_active_chat();
             self.focus = Focus::Input;
         }
     }
@@ -204,13 +218,21 @@ impl App {
         };
 
         let _ = update_title_from_message(&self.pool, chat_id, &message);
-        let _ = add_message(&self.pool, chat_id, "user", &message);
+        let _ = add_message(&self.pool, chat_id, "user", &message, None);
         let _ = publish_chat_change(&ChatChange::Upsert { id: chat_id });
         self.load_chats();
         self.load_messages();
 
+        self.start_turn();
+    }
+
+    fn start_turn(&mut self) {
         self.loading = true;
-        self.loading_chat_id = Some(chat_id);
+        self.loading_chat_id = self.active_chat_id;
+        let chat_id = match self.loading_chat_id {
+            Some(id) => id,
+            None => return,
+        };
         let _ = publish_chat_change(&ChatChange::Activity {
             id: chat_id,
             state: ChatActivityState::Thinking,
@@ -218,151 +240,38 @@ impl App {
         let pool = self.pool.clone();
         let ollama_url = self.ollama_url.clone();
         let model = self.model.clone();
-        let chat_id2 = chat_id;
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
-            Self::run_ollama_loop(ollama_url, model, chat_id2, pool, None, tx).await;
+            let outcome = run_chat_turn(&pool, &ollama_url, &model, chat_id).await;
+            report_outcome(outcome, chat_id, &tx, &pool).await;
         });
-    }
-
-    async fn run_ollama_loop(
-        ollama_url: String,
-        model: String,
-        chat_id: i64,
-        pool: DbPool,
-        extra_messages: Option<Vec<OllamaChatMessage>>,
-        tx: mpsc::UnboundedSender<CliEvent>,
-    ) {
-        let msgs = if let Some(extra) = extra_messages {
-            extra
-        } else {
-            match build_messages_from_db(&pool, chat_id) {
-                Ok(m) => m,
-                Err(e) => {
-                    let _ = tx.send(CliEvent::Error {
-                        chat_id,
-                        message: e,
-                    });
-                    return;
-                }
-            }
-        };
-
-        let tools = Some(tools::get_tool_definitions());
-        match chat_with_ollama(&ollama_url, &model, msgs.clone(), tools).await {
-            Ok(resp) => {
-                let native_tcs = resp.message.tool_calls.clone().unwrap_or_default();
-                let text = &resp.message.content;
-                let parsed_tcs = tools::parse_tool_calls_from_text(text);
-                let clean_text = tools::strip_tool_calls_from_text(text);
-
-                let tool_calls = tools::normalize_tool_calls(
-                    &(if !native_tcs.is_empty() {
-                        native_tcs
-                    } else if !parsed_tcs.is_empty() {
-                        parsed_tcs
-                    } else {
-                        Vec::new()
-                    }),
-                );
-
-                if !clean_text.is_empty() {
-                    let pool2 = pool.clone();
-                    let ct = clean_text.clone();
-                    tokio::task::spawn_blocking(move || {
-                        add_message(&pool2, chat_id, "assistant", &ct).ok();
-                    })
-                    .await
-                    .ok();
-                    let _ = publish_chat_change(&ChatChange::Upsert { id: chat_id });
-                }
-
-                if tool_calls.is_empty() {
-                    let _ = tx.send(CliEvent::TextReady { chat_id });
-                } else {
-                    let mut context = msgs;
-                    context.push(OllamaChatMessage {
-                        role: "assistant".to_string(),
-                        content: clean_text.clone(),
-                        tool_calls: Some(tool_calls.clone()),
-                        name: None,
-                    });
-                    let _ = tx.send(CliEvent::ToolCalls {
-                        chat_id,
-                        tool_calls,
-                        messages: context,
-                    });
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(CliEvent::Error {
-                    chat_id,
-                    message: e,
-                });
-            }
-        }
     }
 
     fn confirm_tool(&mut self) {
-        let (chat_id, tool_calls, messages) = match self.pending_tool_calls.take() {
+        let (chat_id, _) = match self.pending_tool_calls.take() {
             Some(v) => v,
             None => return,
         };
         self.waiting_confirmation = false;
-        self.loading = true;
-        self.loading_chat_id = Some(chat_id);
-        let _ = publish_chat_change(&ChatChange::Activity {
-            id: chat_id,
-            state: ChatActivityState::Thinking,
-        });
-
-        let mut extra = messages;
-        for tc in &tool_calls {
-            let result = match tools::execute_tool(tc) {
-                Ok(res) => res,
-                Err(e) => format!("Error: {e}"),
-            };
-            extra.push(OllamaChatMessage {
-                role: "tool".to_string(),
-                content: result,
-                tool_calls: None,
-                name: Some(tc.function.name.clone()),
-            });
-        }
-
-        let pool = self.pool.clone();
-        let ollama_url = self.ollama_url.clone();
-        let model = self.model.clone();
-        let tx = self.tx.clone();
-
-        tokio::spawn(async move {
-            Self::run_ollama_loop(ollama_url, model, chat_id, pool, Some(extra), tx).await;
-        });
+        self.resolve(chat_id, true);
     }
 
     fn deny_tool(&mut self) {
-        let (chat_id, _tool_calls, messages) = match self.pending_tool_calls.take() {
+        let (chat_id, _) = match self.pending_tool_calls.take() {
             Some(v) => v,
             None => return,
         };
         self.waiting_confirmation = false;
+        self.resolve(chat_id, false);
+    }
+
+    fn resolve(&mut self, chat_id: i64, approved: bool) {
         self.loading = true;
         self.loading_chat_id = Some(chat_id);
         let _ = publish_chat_change(&ChatChange::Activity {
             id: chat_id,
             state: ChatActivityState::Thinking,
-        });
-
-        let mut extra = messages;
-        extra.push(OllamaChatMessage {
-            role: "system".to_string(),
-            content:
-                "The user declined to execute the tool calls. Do not repeat the same request. \
-                      Respond as best you can without the tool."
-                    .to_string(),
-            tool_calls: None,
-            name: None,
         });
 
         let pool = self.pool.clone();
@@ -371,8 +280,39 @@ impl App {
         let tx = self.tx.clone();
 
         tokio::spawn(async move {
-            Self::run_ollama_loop(ollama_url, model, chat_id, pool, Some(extra), tx).await;
+            let outcome =
+                resolve_pending_tools(&pool, &ollama_url, &model, chat_id, approved).await;
+            report_outcome(outcome, chat_id, &tx, &pool).await;
         });
+    }
+}
+
+async fn report_outcome(
+    outcome: Result<TurnOutcome, String>,
+    chat_id: i64,
+    tx: &mpsc::UnboundedSender<CliEvent>,
+    pool: &DbPool,
+) {
+    match outcome {
+        Ok(TurnOutcome::Reply(_)) => {
+            let _ = publish_chat_change(&ChatChange::Activity {
+                id: chat_id,
+                state: ChatActivityState::Idle,
+            });
+            let _ = tx.send(CliEvent::TextReady { chat_id });
+        }
+        Ok(TurnOutcome::PendingTools(_)) => {
+            let _ = tx.send(CliEvent::ToolCallsPending { chat_id });
+        }
+        Err(e) => {
+            let _ = add_message(pool, chat_id, "assistant", &format!("Error: {e}"), None);
+            let _ = publish_chat_change(&ChatChange::Upsert { id: chat_id });
+            let _ = publish_chat_change(&ChatChange::Activity {
+                id: chat_id,
+                state: ChatActivityState::Idle,
+            });
+            let _ = tx.send(CliEvent::Error { chat_id, message: e });
+        }
     }
 }
 
@@ -455,7 +395,7 @@ fn draw_confirmation_panel(frame: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     ))];
 
-    if let Some((_, tool_calls, _)) = &app.pending_tool_calls {
+    if let Some((_, tool_calls)) = &app.pending_tool_calls {
         for tc in tool_calls {
             lines.push(Line::from(""));
             for line in tools::tool_call_description(tc).lines() {
@@ -533,22 +473,54 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(empty, chunks[0]);
     } else if app.active_chat_id.is_some() {
         for msg in &app.messages {
-            let label = match msg.role.as_str() {
-                "user" => "You",
-                "assistant" => "AI",
-                r => r,
-            };
-            let color = match msg.role.as_str() {
-                "user" => Color::Green,
-                "assistant" => Color::Cyan,
-                _ => Color::White,
-            };
-            lines.push(Line::from(Span::styled(
-                format!("[{label}]"),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )));
-            lines.push(Line::from(strip_code_blocks(&msg.content)));
-            lines.push(Line::from(""));
+            match msg.role.as_str() {
+                "tool" => {
+                    let name = msg.name.as_deref().unwrap_or("tool");
+                    let first_line: String = msg
+                        .content
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect();
+                    lines.push(Line::from(Span::styled(
+                        format!("  [{name}] {first_line}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    continue;
+                }
+                role => {
+                    let label = match role {
+                        "user" => "You",
+                        "assistant" => "AI",
+                        other => other,
+                    };
+                    let color = match role {
+                        "user" => Color::Green,
+                        "assistant" => Color::Cyan,
+                        _ => Color::White,
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("[{label}]"),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )));
+                    if let Some(calls) = &msg.tool_calls {
+                        for tc in calls {
+                            for line in tools::tool_call_description(tc).lines() {
+                                lines.push(Line::from(Span::styled(
+                                    format!("  {line}"),
+                                    Style::default().fg(Color::DarkGray),
+                                )));
+                            }
+                        }
+                    }
+                    if !msg.content.is_empty() {
+                        lines.push(Line::from(strip_code_blocks(&msg.content)));
+                    }
+                    lines.push(Line::from(""));
+                }
+            }
         }
 
         if app.is_active_chat_loading() {
@@ -713,34 +685,24 @@ fn run_tui(pool: DbPool) -> io::Result<()> {
 
         if let Ok(event) = app.rx.try_recv() {
             match event {
-                CliEvent::TextReady { chat_id } => {
+                CliEvent::TextReady { chat_id, .. } => {
                     app.loading = false;
                     app.loading_chat_id = None;
-                    let _ = publish_chat_change(&ChatChange::Activity {
-                        id: chat_id,
-                        state: ChatActivityState::Idle,
-                    });
                     if app.active_chat_id == Some(chat_id) {
                         app.load_messages();
                     }
                 }
-                CliEvent::ToolCalls {
-                    chat_id,
-                    tool_calls,
-                    messages,
-                } => {
+                CliEvent::ToolCallsPending { chat_id } => {
                     app.loading = false;
                     app.loading_chat_id = None;
-                    let _ = publish_chat_change(&ChatChange::Activity {
-                        id: chat_id,
-                        state: ChatActivityState::AwaitingToolConfirmation,
-                    });
                     if app.active_chat_id == Some(chat_id) {
                         app.load_messages();
+                        if let Ok(Some(calls)) = load_pending_tools(&app.pool, chat_id) {
+                            app.pending_tool_calls = Some((chat_id, calls));
+                            app.confirmation_scroll = 0;
+                            app.waiting_confirmation = true;
+                        }
                     }
-                    app.pending_tool_calls = Some((chat_id, tool_calls, messages));
-                    app.confirmation_scroll = 0;
-                    app.waiting_confirmation = true;
                 }
                 CliEvent::Error { chat_id, message } => {
                     app.loading = false;
@@ -750,6 +712,7 @@ fn run_tui(pool: DbPool) -> io::Result<()> {
                         chat_id,
                         "assistant",
                         &format!("Error: {message}"),
+                        None,
                     );
                     let _ = publish_chat_change(&ChatChange::Upsert { id: chat_id });
                     let _ = publish_chat_change(&ChatChange::Activity {
@@ -797,8 +760,25 @@ fn run_tui(pool: DbPool) -> io::Result<()> {
                             app.messages = vec![];
                         }
                     }
-                    ChatChange::Upsert { .. } => {}
-                    ChatChange::Activity { .. } => {}
+                    ChatChange::Upsert { id } => {
+                        if app.active_chat_id == Some(*id) && !app.loading {
+                            app.load_messages();
+                            app.refresh_pending_for_active_chat();
+                        }
+                    }
+                    ChatChange::Activity { id, state } => {
+                        if let ChatActivityState::Idle = state
+                            && app.active_chat_id == Some(*id)
+                        {
+                            let still_pending = matches!(
+                                app.pending_tool_calls,
+                                Some((cid, _)) if cid == *id
+                            );
+                            if !still_pending {
+                                app.waiting_confirmation = false;
+                            }
+                        }
+                    }
                 }
             }
             app.load_chats();
@@ -926,7 +906,7 @@ async fn run_one_shot(pool: &DbPool, question: &str) {
     let _ = publish_chat_change(&ChatChange::Upsert { id: chat.id });
 
     let _ = update_title_from_message(pool, chat.id, question);
-    let _ = add_message(pool, chat.id, "user", question);
+    let _ = add_message(pool, chat.id, "user", question, None);
     let _ = publish_chat_change(&ChatChange::Upsert { id: chat.id });
 
     println!("You: {question}");
@@ -936,119 +916,30 @@ async fn run_one_shot(pool: &DbPool, question: &str) {
 }
 
 async fn run_cli_turn(pool: &DbPool, chat_id: i64, ollama_url: &str, model: &str) {
-    let current_msgs = match build_messages_from_db(pool, chat_id) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("\nError: {e}");
-            return;
-        }
-    };
-
-    let mut current_msgs = current_msgs;
-    let tools = Some(tools::get_tool_definitions());
+    let mut turn = run_chat_turn(pool, ollama_url, model, chat_id).await;
     loop {
-        match chat_with_ollama(ollama_url, model, current_msgs.clone(), tools.clone()).await {
-            Ok(resp) => {
-                let native_tcs = resp.message.tool_calls.clone().unwrap_or_default();
-                let text = &resp.message.content;
-                let parsed_tcs = tools::parse_tool_calls_from_text(text);
-                let clean_text = tools::strip_tool_calls_from_text(text);
-
-                let tool_calls = tools::normalize_tool_calls(
-                    &(if !native_tcs.is_empty() {
-                        native_tcs
-                    } else if !parsed_tcs.is_empty() {
-                        parsed_tcs
-                    } else {
-                        Vec::new()
-                    }),
-                );
-
-                if !clean_text.is_empty() {
-                    println!("{}", strip_code_blocks(&clean_text));
-                    let _ = add_message(pool, chat_id, "assistant", &clean_text);
-                    let _ = publish_chat_change(&ChatChange::Upsert { id: chat_id });
+        match turn {
+            Ok(TurnOutcome::Reply(text)) => {
+                if !text.trim().is_empty() {
+                    println!("{}", strip_code_blocks(&text));
                 }
-
-                if tool_calls.is_empty() {
-                    let blocks = tools::extract_code_blocks(&clean_text);
-                    if !blocks.is_empty() {
-                        println!("\nThe AI output code blocks instead of creating files.");
-                        for (i, block) in blocks.iter().enumerate() {
-                            println!("\n--- Code block {} ({}) ---", i + 1, block.language);
-                            for line in block.code.lines() {
-                                println!("  {line}");
-                            }
-                            print!("\nEnter filename to create (or 'n' to skip): ");
-                            io::stdout().flush().ok();
-                            let mut input = String::new();
-                            io::stdin().read_line(&mut input).ok();
-                            let input = input.trim().to_string();
-                            if !input.is_empty() && !input.eq_ignore_ascii_case("n") {
-                                let cwd = std::env::current_dir().ok();
-                                let path = if input.starts_with('/') {
-                                    input.clone()
-                                } else if let Some(ref dir) = cwd {
-                                    format!("{}/{}", dir.display(), input)
-                                } else {
-                                    input.clone()
-                                };
-                                if let Some(parent) = std::path::Path::new(&path).parent() {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                match std::fs::write(&path, &block.code) {
-                                    Ok(_) => println!("  Created {path}"),
-                                    Err(e) => println!("  Error: {e}"),
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
-
-                current_msgs.push(OllamaChatMessage {
-                    role: "assistant".to_string(),
-                    content: clean_text.clone(),
-                    tool_calls: Some(tool_calls.clone()),
-                    name: None,
-                });
-
+                return;
+            }
+            Ok(TurnOutcome::PendingTools(calls)) => {
                 println!();
-                for tc in &tool_calls {
+                for tc in &calls {
                     println!("  {}", tools::tool_call_description(tc));
                 }
                 print!("\nExecute? [y/N] ");
                 io::stdout().flush().ok();
                 let mut input = String::new();
                 io::stdin().read_line(&mut input).ok();
-
-                if input.trim().eq_ignore_ascii_case("y") {
-                    for tc in &tool_calls {
-                        let result = match tools::execute_tool(tc) {
-                            Ok(r) => r,
-                            Err(e) => format!("Error: {e}"),
-                        };
-                        current_msgs.push(OllamaChatMessage {
-                            role: "tool".to_string(),
-                            content: result,
-                            tool_calls: None,
-                            name: Some(tc.function.name.clone()),
-                        });
-                    }
-                } else {
-                    for tc in &tool_calls {
-                        current_msgs.push(OllamaChatMessage {
-                            role: "tool".to_string(),
-                            content: "User declined to execute.".to_string(),
-                            tool_calls: None,
-                            name: Some(tc.function.name.clone()),
-                        });
-                    }
-                }
+                let approved = input.trim().eq_ignore_ascii_case("y");
+                turn = resolve_pending_tools(pool, ollama_url, model, chat_id, approved).await;
             }
             Err(e) => {
                 eprintln!("\nError: {e}");
-                break;
+                return;
             }
         }
     }
@@ -1088,7 +979,7 @@ async fn run_plain_loop(pool: &DbPool) {
         }
 
         let _ = update_title_from_message(pool, chat.id, &question);
-        let _ = add_message(pool, chat.id, "user", &question);
+        let _ = add_message(pool, chat.id, "user", &question, None);
         let _ = publish_chat_change(&ChatChange::Upsert { id: chat.id });
 
         print!("AI: ");

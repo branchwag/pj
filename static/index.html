@@ -244,6 +244,16 @@
         margin-right: auto;
       }
 
+      .message.tool,
+      .message.toolcall {
+        background-color: transparent;
+        color: #6b7280;
+        font-family: monospace;
+        font-size: 0.8rem;
+        max-width: 90%;
+        padding: 0.15rem 1rem;
+      }
+
       .empty-state {
         margin: auto;
         text-align: center;
@@ -423,6 +433,95 @@
           max-width: 95%;
         }
       }
+
+      .input-container {
+        flex-direction: column;
+        gap: 0;
+        padding: 0.5rem 1rem 1rem 1rem;
+      }
+
+      .input-row {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+      }
+
+      .image-preview-bar {
+        display: flex;
+        gap: 0.5rem;
+        padding: 0.4rem 0;
+        overflow-x: auto;
+        min-height: 0;
+      }
+
+      .image-preview-bar:empty {
+        display: none;
+      }
+
+      .image-preview-item {
+        position: relative;
+        flex-shrink: 0;
+      }
+
+      .image-preview-item img {
+        width: 72px;
+        height: 72px;
+        object-fit: cover;
+        border-radius: 0.375rem;
+        border: 1px solid #374151;
+      }
+
+      .image-preview-item .remove-img {
+        position: absolute;
+        top: -4px;
+        right: -4px;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: #dc2626;
+        color: #fff;
+        border: none;
+        cursor: pointer;
+        font-size: 0.7rem;
+        line-height: 18px;
+        text-align: center;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .attach-btn {
+        background: none;
+        border: 1px solid #374151;
+        color: #9ca3af;
+        cursor: pointer;
+        font-size: 1.2rem;
+        padding: 0.5rem 0.6rem;
+        border-radius: 0.375rem;
+        transition: color 0.15s, border-color 0.15s;
+        flex-shrink: 0;
+      }
+
+      .attach-btn:hover {
+        color: #ededed;
+        border-color: #6b7280;
+      }
+
+      .chat-container.drag-over {
+        outline: 2px dashed #60a5fa;
+        outline-offset: -4px;
+        background-color: rgba(96, 165, 250, 0.05);
+      }
+
+      .message img.chat-image {
+        max-width: 300px;
+        max-height: 300px;
+        border-radius: 0.375rem;
+        margin-bottom: 0.5rem;
+        display: block;
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
@@ -446,13 +545,18 @@
         <div class="empty-state" id="emptyState">Select a chat or create a new one</div>
       </div>
       <div class="input-container">
-        <input
-          type="text"
-          id="messageInput"
-          placeholder="Type your message..."
-          autocomplete="off"
-        />
-        <button id="sendButton">Send</button>
+        <div class="image-preview-bar" id="imagePreviewBar"></div>
+        <div class="input-row">
+          <input type="file" id="imageFileInput" accept="image/*" multiple hidden />
+          <button class="attach-btn" id="attachBtn" title="Attach image">+</button>
+          <input
+            type="text"
+            id="messageInput"
+            placeholder="Type your message..."
+            autocomplete="off"
+          />
+          <button id="sendButton">Send</button>
+        </div>
       </div>
     </main>
 
@@ -486,15 +590,15 @@
       let activeChatId = null;
       let chats = [];
 
-      let pendingSessionId = null;
       let pendingToolCalls = [];
-      let pendingSessionChatId = null;
+      let pendingChatId = null;
       let sharedActivityByChat = {};
       let chatEventSource = null;
       let lastChatEventAt = 0;
       let lastChatRefreshAt = 0;
       let lastKnownChatIds = new Set();
       let chatRefreshInFlight = null;
+      let pendingImages = [];
 
       const CHAT_EVENT_STALE_MS = 20000;
       const CHAT_RECONNECT_CHECK_MS = 5000;
@@ -509,7 +613,7 @@
       }
 
       function getActiveChatActivityState() {
-        if (pendingSessionChatId !== null && pendingSessionChatId === activeChatId) {
+        if (pendingToolCalls.length > 0 && pendingChatId === activeChatId) {
           return "awaiting_tool_confirmation";
         }
         if (isLoading && loadingChatId !== null && loadingChatId === activeChatId) {
@@ -531,10 +635,9 @@
       }
 
       function clearPendingStateForChat(chatId) {
-        if (pendingSessionChatId === chatId) {
-          pendingSessionId = null;
+        if (pendingChatId === chatId) {
           pendingToolCalls = [];
-          pendingSessionChatId = null;
+          pendingChatId = null;
         }
       }
 
@@ -607,10 +710,22 @@
         }
       }
 
-      function addMessage(content, role) {
+      function addMessage(content, role, images) {
         removeEmptyState();
         const messageDiv = document.createElement("div");
         messageDiv.className = "message " + role;
+
+        if (images && images.length > 0) {
+          for (const b64 of images) {
+            const img = document.createElement("img");
+            img.className = "chat-image";
+            img.src = "data:image/png;base64," + b64;
+            img.addEventListener("click", () => {
+              window.open(img.src, "_blank");
+            });
+            messageDiv.appendChild(img);
+          }
+        }
 
         const codeBlockRe = /```(\w*)\n([\s\S]*?)```/g;
         let lastIndex = 0;
@@ -682,10 +797,36 @@
         const activity = getActiveChatActivityState();
         if (activity === "thinking") {
           addLoadingMessage("Thinking...");
-        } else if (activity === "awaiting_tool_confirmation" && pendingSessionChatId !== activeChatId) {
+        } else if (activity === "awaiting_tool_confirmation" && pendingChatId !== activeChatId) {
           addLoadingMessage("Awaiting tool confirmation in another client...");
         } else {
           document.getElementById("loadingMessage")?.remove();
+        }
+      }
+
+      function describeToolCall(tc) {
+        const args = tc.function.arguments || {};
+        if (tc.function.name === "write_file") return "Write " + (args.path || "?") + " (" + ((args.content || "").length) + " bytes)";
+        if (tc.function.name === "edit_file") return "Edit " + (args.path || "?");
+        if (tc.function.name === "read_file") return "Read " + (args.path || "?");
+        if (tc.function.name === "run_command") return "Run: " + (args.command || "?");
+        if (tc.function.name === "glob") return "Glob: " + (args.pattern || "?");
+        if (tc.function.name === "grep") return "Grep '" + (args.pattern || "?") + "' in " + (args.path || ".");
+        if (tc.function.name === "read_directory") return "List " + (args.path || "?");
+        return tc.function.name;
+      }
+
+      async function fetchAndShowPendingTools(chatId) {
+        try {
+          const res = await fetch("/api/chats/" + chatId + "/pending-tools", { cache: "no-store" });
+          if (!res.ok) return;
+          const data = await res.json();
+          if (data.tool_calls && data.tool_calls.length > 0 && activeChatId === chatId) {
+            showToolModal(data.tool_calls, chatId);
+            syncComposerState();
+          }
+        } catch (e) {
+          console.error("Failed to fetch pending tools:", e);
         }
       }
 
@@ -694,18 +835,33 @@
         const messages = await res.json();
         chatContainer.innerHTML = "";
         for (const msg of messages) {
-          addMessage(msg.content, msg.role);
+          if (msg.role === "tool") {
+            const div = document.createElement("div");
+            div.className = "message tool";
+            div.textContent = "  [" + (msg.name || "tool") + "] " + (msg.content || "").split("\n")[0].substring(0, 160);
+            chatContainer.appendChild(div);
+          } else {
+            addMessage(msg.content, msg.role, msg.images);
+            if (msg.tool_calls) {
+              for (const tc of msg.tool_calls) {
+                const div = document.createElement("div");
+                div.className = "message toolcall";
+                div.textContent = "  -> " + describeToolCall(tc);
+                chatContainer.appendChild(div);
+              }
+            }
+          }
         }
         if (messages.length === 0 && getActiveChatActivityState() === "idle") {
           showEmptyState();
         }
         renderSharedActivity();
         if (
-          pendingSessionId &&
-          pendingSessionChatId === id &&
+          pendingToolCalls.length > 0 &&
+          pendingChatId === id &&
           !isLoading
         ) {
-          showToolModal(pendingToolCalls, pendingSessionId, id);
+          showToolModal(pendingToolCalls, id);
         } else {
           toolModal.classList.remove("visible");
         }
@@ -720,6 +876,41 @@
       function showEmptyState() {
         chatContainer.innerHTML =
           '<div class="empty-state" id="emptyState">Select a chat or create a new one</div>';
+      }
+
+      function renderImagePreviews() {
+        const bar = document.getElementById("imagePreviewBar");
+        bar.innerHTML = "";
+        for (let i = 0; i < pendingImages.length; i++) {
+          const item = document.createElement("div");
+          item.className = "image-preview-item";
+          const img = document.createElement("img");
+          img.src = "data:image/png;base64," + pendingImages[i];
+          const btn = document.createElement("button");
+          btn.className = "remove-img";
+          btn.textContent = "\u00d7";
+          btn.addEventListener("click", () => {
+            pendingImages.splice(i, 1);
+            renderImagePreviews();
+          });
+          item.appendChild(img);
+          item.appendChild(btn);
+          bar.appendChild(item);
+        }
+      }
+
+      function addPendingImageFromBlob(blob) {
+        if (!blob.type.startsWith("image/")) return;
+        if (blob.size > 10 * 1024 * 1024) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64 = reader.result.split(",")[1];
+          if (base64) {
+            pendingImages.push(base64);
+            renderImagePreviews();
+          }
+        };
+        reader.readAsDataURL(blob);
       }
 
       async function loadChats() {
@@ -764,7 +955,7 @@
 
       function hasSharedRemoteActivity() {
         return (
-          pendingSessionChatId !== null ||
+          pendingChatId !== null ||
           Object.keys(sharedActivityByChat).length > 0
         );
       }
@@ -805,7 +996,8 @@
       async function selectChat(id) {
         activeChatId = id;
         toolModal.classList.remove("visible");
-        pathInputs = [];
+        pendingImages = [];
+        renderImagePreviews();
         renderChatList();
         chatContainer.innerHTML = "";
         syncComposerState();
@@ -887,10 +1079,17 @@
               const state = change.Activity.state;
               if (state === "Idle") {
                 delete sharedActivityByChat[chatId];
+                if (chatId === activeChatId && pendingChatId === chatId) {
+                  pendingToolCalls = [];
+                  pendingChatId = null;
+                }
               } else if (state === "Thinking") {
                 sharedActivityByChat[chatId] = "thinking";
               } else if (state === "AwaitingToolConfirmation") {
                 sharedActivityByChat[chatId] = "awaiting_tool_confirmation";
+                if (activeChatId === chatId && pendingToolCalls.length === 0) {
+                  await fetchAndShowPendingTools(chatId);
+                }
               }
             }
             await refreshChatsWithFallback();
@@ -972,17 +1171,12 @@
         }
       }
 
-      let pathInputs = [];
-
-      function showToolModal(toolCalls, sessionId, chatId = activeChatId) {
+      function showToolModal(toolCalls, chatId = activeChatId) {
         pendingToolCalls = toolCalls;
-        pendingSessionId = sessionId;
-        pendingSessionChatId = chatId;
+        pendingChatId = chatId;
         toolCallsList.innerHTML = "";
-        pathInputs = [];
 
-        for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
-          const tc = toolCalls[tcIdx];
+        for (const tc of toolCalls) {
           const div = document.createElement("div");
           div.className = "tool-call-item";
 
@@ -995,37 +1189,30 @@
           const args = tc.function.arguments || {};
 
           if (tc.function.name === "write_file") {
-            const pathLabel = document.createElement("div");
-            pathLabel.textContent = "Path:";
-            const pathInput = document.createElement("input");
-            pathInput.type = "text";
-            pathInput.value = args.path || "/tmp/script.sh";
-            pathInput.style.width = "100%";
-            pathInput.style.marginBottom = "0.5rem";
-            pathInput.style.fontFamily = "inherit";
-            pathInput.style.padding = "0.3rem";
-            pathInput.style.boxSizing = "border-box";
             const sizeText = document.createElement("div");
-            sizeText.textContent = "Size: " + (args.content ? args.content.length : 0) + " bytes";
-            const previewText = document.createElement("div");
+            sizeText.textContent = describeToolCall(tc);
+            const previewText = document.createElement("pre");
             previewText.style.marginTop = "0.3rem";
             previewText.style.fontSize = "0.8rem";
-            previewText.style.color = "#9ca3af";
-            previewText.textContent = (args.content || "").substring(0, 120) + ((args.content || "").length > 120 ? "..." : "");
-            detailDiv.appendChild(pathLabel);
-            detailDiv.appendChild(pathInput);
+            previewText.style.maxHeight = "8rem";
+            previewText.style.overflow = "auto";
+            previewText.textContent = (args.content || "").substring(0, 800) + ((args.content || "").length > 800 ? "\n..." : "");
             detailDiv.appendChild(sizeText);
             detailDiv.appendChild(previewText);
-            pathInputs.push({ name: tc.function.name, index: tcIdx, input: pathInput });
           } else if (tc.function.name === "edit_file") {
-            detailDiv.textContent = "Path: " + (args.path || "?") + "\nReplace: " + (args.old_string || "") + "\nWith: " + (args.new_string || "");
+            const oldPre = document.createElement("pre");
+            oldPre.style.cssText = "margin:0.3rem 0;font-size:0.8rem;max-height:6rem;overflow:auto;white-space:pre-wrap;";
+            oldPre.textContent = "- " + (args.old_string || "");
+            const newPre = document.createElement("pre");
+            newPre.style.cssText = "margin:0;font-size:0.8rem;max-height:6rem;overflow:auto;white-space:pre-wrap;color:#9ca3af;";
+            newPre.textContent = "+ " + (args.new_string || "");
+            const pLabel = document.createElement("div");
+            pLabel.textContent = args.path || "?";
+            detailDiv.appendChild(pLabel);
+            detailDiv.appendChild(oldPre);
+            detailDiv.appendChild(newPre);
           } else {
-            detailDiv.textContent = tc.function.name === "read_file" ? "Path: " + (args.path || "?")
-              : tc.function.name === "run_command" ? "Command: " + (args.command || "?")
-              : tc.function.name === "glob" ? "Pattern: " + (args.pattern || "?")
-              : tc.function.name === "grep" ? "Pattern: " + (args.pattern || "?") + "\nPath: " + (args.path || ".")
-              : tc.function.name === "read_directory" ? "Path: " + (args.path || "?")
-              : JSON.stringify(args, null, 2);
+            detailDiv.textContent = describeToolCall(tc);
           }
 
           div.appendChild(nameDiv);
@@ -1038,16 +1225,19 @@
 
       async function sendCodingMessage() {
         const message = messageInput.value.trim();
-        if (!message || isLoading) return;
+        if ((!message && pendingImages.length === 0) || isLoading) return;
 
         if (!activeChatId) {
           await createNewChat();
         }
 
         const requestChatId = activeChatId;
+        const imagesToSend = pendingImages.length > 0 ? [...pendingImages] : undefined;
 
-        addMessage(message, "user");
+        addMessage(message || "", "user", imagesToSend);
         messageInput.value = "";
+        pendingImages = [];
+        renderImagePreviews();
         updateChatTitle(requestChatId, message.length > 50 ? message.substring(0, 50) + "..." : message);
 
         isLoading = true;
@@ -1059,7 +1249,7 @@
           const response = await fetch("/api/chat/tools", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: requestChatId, message }),
+            body: JSON.stringify({ chat_id: requestChatId, message, images: imagesToSend }),
           });
 
           const data = await response.json();
@@ -1080,11 +1270,10 @@
             }
           } else if (data.type === "tool_calls") {
             if (activeChatId === requestChatId) {
-              showToolModal(data.tool_calls, data.session_id, requestChatId);
+              showToolModal(data.tool_calls, requestChatId);
             } else {
               pendingToolCalls = data.tool_calls;
-              pendingSessionId = data.session_id;
-              pendingSessionChatId = requestChatId;
+              pendingChatId = requestChatId;
             }
           }
         } catch (error) {
@@ -1106,15 +1295,8 @@
       }
 
       async function handleToolConfirm() {
-        if (!pendingSessionId || pendingSessionChatId !== activeChatId) return;
-        const requestChatId = pendingSessionChatId;
-
-        const modified = [];
-        for (const pi of pathInputs) {
-          if (pi.input.value !== pendingToolCalls[pi.index]?.function?.arguments?.path) {
-            modified.push({ index: pi.index, path: pi.input.value });
-          }
-        }
+        if (pendingToolCalls.length === 0 || pendingChatId !== activeChatId) return;
+        const requestChatId = pendingChatId;
 
         toolModal.classList.remove("visible");
         isLoading = true;
@@ -1127,9 +1309,8 @@
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              session_id: pendingSessionId,
+              chat_id: requestChatId,
               approved: true,
-              modified_paths: modified.length > 0 ? modified : undefined,
             }),
           });
 
@@ -1137,10 +1318,8 @@
           if (activeChatId === requestChatId) {
             document.getElementById("loadingMessage")?.remove();
           }
-          pendingSessionId = null;
           pendingToolCalls = [];
-          pendingSessionChatId = null;
-          pathInputs = [];
+          pendingChatId = null;
 
           if (!response.ok) {
             if (activeChatId === requestChatId) {
@@ -1152,11 +1331,10 @@
             }
           } else if (data.type === "tool_calls") {
             if (activeChatId === requestChatId) {
-              showToolModal(data.tool_calls, data.session_id, requestChatId);
+              showToolModal(data.tool_calls, requestChatId);
             } else {
               pendingToolCalls = data.tool_calls;
-              pendingSessionId = data.session_id;
-              pendingSessionChatId = requestChatId;
+              pendingChatId = requestChatId;
             }
           }
         } catch (error) {
@@ -1174,8 +1352,8 @@
       }
 
       async function handleToolDeny() {
-        if (!pendingSessionId || pendingSessionChatId !== activeChatId) return;
-        const requestChatId = pendingSessionChatId;
+        if (pendingToolCalls.length === 0 || pendingChatId !== activeChatId) return;
+        const requestChatId = pendingChatId;
 
         toolModal.classList.remove("visible");
         isLoading = true;
@@ -1187,16 +1365,15 @@
           const response = await fetch("/api/chat/tools/confirm", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: pendingSessionId, approved: false }),
+            body: JSON.stringify({ chat_id: requestChatId, approved: false }),
           });
 
           const data = await response.json();
           if (activeChatId === requestChatId) {
             document.getElementById("loadingMessage")?.remove();
           }
-          pendingSessionId = null;
           pendingToolCalls = [];
-          pendingSessionChatId = null;
+          pendingChatId = null;
 
           if (!response.ok) {
             if (activeChatId === requestChatId) {
@@ -1208,11 +1385,10 @@
             }
           } else if (data.type === "tool_calls") {
             if (activeChatId === requestChatId) {
-              showToolModal(data.tool_calls, data.session_id, requestChatId);
+              showToolModal(data.tool_calls, requestChatId);
             } else {
               pendingToolCalls = data.tool_calls;
-              pendingSessionId = data.session_id;
-              pendingSessionChatId = requestChatId;
+              pendingChatId = requestChatId;
             }
           }
         } catch (error) {
@@ -1236,6 +1412,45 @@
       });
       confirmBtn.addEventListener("click", handleToolConfirm);
       denyBtn.addEventListener("click", handleToolDeny);
+
+      const attachBtn = document.getElementById("attachBtn");
+      const imageFileInput = document.getElementById("imageFileInput");
+      attachBtn.addEventListener("click", () => imageFileInput.click());
+      imageFileInput.addEventListener("change", () => {
+        for (const file of imageFileInput.files) {
+          addPendingImageFromBlob(file);
+        }
+        imageFileInput.value = "";
+      });
+
+      messageInput.addEventListener("paste", (e) => {
+        const items = e.clipboardData?.items;
+        if (!items) return;
+        for (const item of items) {
+          if (item.type.startsWith("image/")) {
+            e.preventDefault();
+            const blob = item.getAsFile();
+            if (blob) addPendingImageFromBlob(blob);
+          }
+        }
+      });
+
+      chatContainer.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        chatContainer.classList.add("drag-over");
+      });
+      chatContainer.addEventListener("dragleave", () => {
+        chatContainer.classList.remove("drag-over");
+      });
+      chatContainer.addEventListener("drop", (e) => {
+        e.preventDefault();
+        chatContainer.classList.remove("drag-over");
+        const files = e.dataTransfer?.files;
+        if (!files) return;
+        for (const file of files) {
+          addPendingImageFromBlob(file);
+        }
+      });
 
       document.getElementById("toggleSidebar").addEventListener("click", () => {
         const sidebar = document.getElementById("sidebar");

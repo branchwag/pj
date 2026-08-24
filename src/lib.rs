@@ -9,7 +9,7 @@ use std::io::Read;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use tokio::sync::broadcast;
 
 pub mod tools;
@@ -41,9 +41,24 @@ pub fn database_url() -> String {
 
 fn model_presets() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
-        ("speed", "qwen2.5:1.5b", "Fastest responses, lowest quality"),
-        ("balanced", "qwen2.5:3b", "Good speed/quality tradeoff (default)"),
-        ("quality", "qwen2.5:7b", "Best quality, slower on CPU"),
+        (
+            "speed",
+            "gpt-oss:20b-cloud",
+            "Fast free cloud model with solid tool calling",
+        ),
+        (
+            "balanced",
+            "gpt-oss:120b-cloud",
+            "Strong open coding model on Ollama's free cloud tier (default)",
+        ),
+        (
+            "quality",
+            "minimax-m3:cloud",
+            "Agentic cloud model with 1M token context",
+        ),
+        ("local-speed", "qwen2.5:1.5b", "Local, fully offline, fastest"),
+        ("local-balanced", "qwen2.5:3b", "Local, offline, balanced"),
+        ("local-quality", "qwen2.5:7b", "Local, offline, best quality"),
     ]
 }
 
@@ -58,7 +73,7 @@ pub fn resolve_model() -> String {
         }
     }
     eprintln!("Unknown MODEL_PRESET '{preset}', using balanced default");
-    "qwen2.5:3b".to_string()
+    "gpt-oss:120b-cloud".to_string()
 }
 
 pub fn model_name() -> String {
@@ -239,6 +254,11 @@ pub struct MessageOut {
     pub role: String,
     pub content: String,
     pub created_at: String,
+    pub images: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 pub fn create_pool(database_url: &str) -> DbPool {
@@ -269,6 +289,20 @@ pub fn init_db(pool: &DbPool) {
             content TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+        );",
+    )
+    .unwrap();
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN images TEXT DEFAULT NULL", []);
+    let _ = conn.execute(
+        "ALTER TABLE messages ADD COLUMN tool_calls TEXT DEFAULT NULL",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN name TEXT DEFAULT NULL", []);
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_tools (
+            chat_id INTEGER PRIMARY KEY,
+            tool_calls TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );",
     )
     .unwrap();
@@ -323,8 +357,18 @@ pub fn create_chat(pool: &DbPool) -> Result<ChatSummary, String> {
     Ok(chat)
 }
 
+pub fn chat_exists(pool: &DbPool, id: i64) -> Result<bool, String> {
+    let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chats WHERE id = ?1", params![id], |r| r.get(0))
+        .map_err(|e| format!("{e}"))?;
+    Ok(count > 0)
+}
+
 pub fn delete_chat(pool: &DbPool, id: i64) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    conn.execute("DELETE FROM pending_tools WHERE chat_id = ?1", params![id])
+        .map_err(|e| format!("{e}"))?;
     conn.execute("DELETE FROM messages WHERE chat_id = ?1", params![id])
         .map_err(|e| format!("{e}"))?;
     conn.execute("DELETE FROM chats WHERE id = ?1", params![id])
@@ -336,19 +380,30 @@ pub fn get_messages(pool: &DbPool, chat_id: i64) -> Result<Vec<MessageOut>, Stri
     let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, role, content, created_at
+            "SELECT id, role, content, created_at, images, name, tool_calls
              FROM messages
              WHERE chat_id = ?1
-             ORDER BY created_at ASC",
+             ORDER BY created_at ASC, id ASC",
         )
         .map_err(|e| format!("{e}"))?;
     let rows = stmt
         .query_map(params![chat_id], |row| {
+            let images_json: Option<String> = row.get(4)?;
+            let images = images_json
+                .and_then(|j| serde_json::from_str::<Vec<String>>(&j).ok());
+            let name: Option<String> = row.get(5)?;
+            let tool_calls_json: Option<String> = row.get(6)?;
+            let tool_calls = tool_calls_json
+                .and_then(|j| serde_json::from_str::<Vec<ToolCall>>(&j).ok())
+                .filter(|t| !t.is_empty());
             Ok(MessageOut {
                 id: row.get(0)?,
                 role: row.get(1)?,
                 content: row.get(2)?,
                 created_at: row.get(3)?,
+                images,
+                name,
+                tool_calls,
             })
         })
         .map_err(|e| format!("{e}"))?;
@@ -359,11 +414,31 @@ pub fn get_messages(pool: &DbPool, chat_id: i64) -> Result<Vec<MessageOut>, Stri
     Ok(messages)
 }
 
-pub fn add_message(pool: &DbPool, chat_id: i64, role: &str, content: &str) -> Result<(), String> {
+pub fn add_message(
+    pool: &DbPool,
+    chat_id: i64,
+    role: &str,
+    content: &str,
+    images: Option<&[String]>,
+) -> Result<(), String> {
+    add_message_with_name(pool, chat_id, role, content, None, images)
+}
+
+pub fn add_message_with_name(
+    pool: &DbPool,
+    chat_id: i64,
+    role: &str,
+    content: &str,
+    name: Option<&str>,
+    images: Option<&[String]>,
+) -> Result<(), String> {
     let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    let images_json = images
+        .map(|imgs| serde_json::to_string(imgs).map_err(|e| format!("JSON: {e}")))
+        .transpose()?;
     conn.execute(
-        "INSERT INTO messages (chat_id, role, content) VALUES (?1, ?2, ?3)",
-        params![chat_id, role, content],
+        "INSERT INTO messages (chat_id, role, content, name, images) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![chat_id, role, content, name, images_json],
     )
     .map_err(|e| format!("{e}"))?;
     Ok(())
@@ -464,6 +539,8 @@ pub struct OllamaChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -481,308 +558,53 @@ pub struct OllamaChatResponse {
     pub done: bool,
 }
 
-fn extract_tool_calls_from_response(message: &OllamaChatMessage) -> Vec<ToolCall> {
-    let native_tcs = message.tool_calls.clone().unwrap_or_default();
-    if !native_tcs.is_empty() {
-        native_tcs
-    } else {
-        tools::parse_tool_calls_from_text(&message.content)
-    }
+#[derive(Debug, Deserialize)]
+struct OllamaShowResponse {
+    capabilities: Option<Vec<String>>,
 }
 
-fn latest_user_message(messages: &[OllamaChatMessage]) -> Option<&str> {
-    messages
-        .iter()
-        .rev()
-        .find(|msg| msg.role == "user")
-        .map(|msg| msg.content.as_str())
-}
+static VISION_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ToolChatIntent {
-    General,
-    CreateFile,
-    EditFile,
-}
-
-fn contains_any(content: &str, phrases: &[&str]) -> bool {
-    phrases.iter().any(|phrase| content.contains(phrase))
-}
-
-fn suggested_write_path_for_request(content: &str) -> &'static str {
-    let lower = content.to_lowercase();
-    if lower.contains("python") {
-        "/tmp/script.py"
-    } else if lower.contains("javascript") || lower.contains("node") {
-        "/tmp/script.js"
-    } else if lower.contains("typescript") {
-        "/tmp/script.ts"
-    } else if lower.contains("rust") {
-        "/tmp/main.rs"
-    } else if lower.contains("bash") || lower.contains("shell") || lower.contains("sh script") {
-        "/tmp/script.sh"
-    } else {
-        "/tmp/tool_output.txt"
-    }
-}
-
-fn classify_tool_chat_intent(content: &str) -> ToolChatIntent {
-    let lower = content.to_lowercase();
-    let edit_request = contains_any(&lower, &[
-        "edit this file",
-        "modify this file",
-        "update this file",
-        "edit the file",
-        "modify the file",
-        "update the file",
-        "change this file",
-        "change the file",
-        "patch this file",
-        "patch the file",
-        "rewrite this file",
-        "rewrite the file",
-    ]);
-    if edit_request {
-        return ToolChatIntent::EditFile;
-    }
-
-    let has_create_verb = contains_any(
-        &lower,
-        &[
-            "create",
-            "make",
-            "write",
-            "save",
-            "generate",
-            "build",
-        ],
-    );
-    let mentions_file_target = contains_any(
-        &lower,
-        &[
-            " file",
-            " script",
-            ".py",
-            ".js",
-            ".ts",
-            ".rs",
-            ".sh",
-            " python script",
-            " javascript script",
-            " bash script",
-            " shell script",
-        ],
-    );
-    let direct_create_request = contains_any(
-        &lower,
-        &[
-            "write code",
-            "create code",
-            "write me a",
-            "make me a",
-            "create me a",
-        ],
-    );
-    let create_request = (has_create_verb && mentions_file_target) || direct_create_request;
-    if create_request {
-        ToolChatIntent::CreateFile
-    } else {
-        ToolChatIntent::General
-    }
-}
-
-fn tool_calls_satisfy_intent(intent: ToolChatIntent, tool_calls: &[ToolCall]) -> bool {
-    match intent {
-        ToolChatIntent::General => true,
-        ToolChatIntent::CreateFile => tool_calls
-            .iter()
-            .any(|tool_call| tool_call.function.name == "write_file"),
-        ToolChatIntent::EditFile => tool_calls
-            .iter()
-            .any(|tool_call| tool_call.function.name == "edit_file"),
-    }
-}
-
-fn tool_results_satisfy_intent(intent: ToolChatIntent, messages: &[OllamaChatMessage]) -> bool {
-    let required_tool = match intent {
-        ToolChatIntent::General => return false,
-        ToolChatIntent::CreateFile => "write_file",
-        ToolChatIntent::EditFile => "edit_file",
-    };
-
-    messages.iter().rev().any(|message| {
-        message.role == "tool" && message.name.as_deref() == Some(required_tool)
-    })
-}
-
-fn extract_file_content_from_response_text(text: &str) -> String {
-    let code_blocks = tools::extract_code_blocks(text);
-    if !code_blocks.is_empty() {
-        return code_blocks
-            .into_iter()
-            .map(|block| block.code)
-            .collect::<Vec<_>>()
-            .join("\n\n")
-            .trim()
-            .to_string();
-    }
-
-    tools::strip_tool_calls_from_text(text).trim().to_string()
-}
-
-async fn generate_create_file_tool_call(
-    client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    user_request: &str,
-) -> Result<ToolCall, String> {
-    let path = suggested_write_path_for_request(user_request).to_string();
-    let request = OllamaChatRequest {
-        model: model.to_string(),
-        messages: vec![
-            OllamaChatMessage {
-                role: "system".to_string(),
-                content: "Return only the full file contents for the requested file. Do not include markdown fences, explanations, XML tags, or tool-call syntax.".to_string(),
-                tool_calls: None,
-                name: None,
-            },
-            OllamaChatMessage {
-                role: "user".to_string(),
-                content: format!(
-                    "Create the requested file content for this request:\n{user_request}\n\nTarget path: {path}"
-                ),
-                tool_calls: None,
-                name: None,
-            },
-        ],
-        stream: false,
-        tools: None,
-    };
-
-    let response = client
-        .post(url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to Ollama for file content generation: {e}"))?;
-
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read file generation response body: {e}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "Ollama returned error {status} while generating file content: {text}"
-        ));
-    }
-
-    let resp: OllamaChatResponse = serde_json::from_str(&text).map_err(|e| {
-        let preview: String = text.chars().take(500).collect();
-        format!("Failed to parse file generation response ({e}): {preview}")
-    })?;
-    let content = extract_file_content_from_response_text(&resp.message.content);
-    if content.is_empty() {
-        return Err("Model returned empty file content for create-file request.".to_string());
-    }
-
-    Ok(ToolCall {
-        function: tools::ToolCallFunction {
-            name: "write_file".to_string(),
-            arguments: serde_json::json!({
-                "path": path,
-                "content": content,
-            }),
-        },
-    })
-}
-
-fn response_claims_file_change_without_tool_call(content: &str) -> bool {
-    let lower = content.to_lowercase();
-    let mentions_tmp = lower.contains("/tmp/");
-    let mentions_code_block = content.contains("```");
-    let claims_file_write = [
-        "i created",
-        "i've created",
-        "i saved",
-        "i wrote",
-        "i made",
-        "created the file",
-        "saved the file",
-        "written to",
-        "file has been created",
-    ]
-    .iter()
-    .any(|phrase| lower.contains(phrase));
-
-    (mentions_tmp && claims_file_write) || mentions_code_block
-}
-
-fn should_force_tool_retry(
-    requested_tools: bool,
-    intent: ToolChatIntent,
-    intent_already_satisfied: bool,
-    tool_calls: &[ToolCall],
-    clean_text: &str,
-) -> bool {
-    if !requested_tools {
-        return false;
-    }
-
-    if intent_already_satisfied {
-        return false;
-    }
-
-    if !tool_calls_satisfy_intent(intent, tool_calls) && intent != ToolChatIntent::General
+pub async fn model_supports_vision(ollama_url: &str, model: &str) -> bool {
+    let cache = VISION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
-        return true;
-    }
-
-    if !tool_calls.is_empty() {
-        return false;
-    }
-
-    if response_claims_file_change_without_tool_call(clean_text) {
-        return true;
-    }
-
-    clean_text.contains("```") && intent != ToolChatIntent::General
-}
-
-fn correction_message_for_intent(intent: ToolChatIntent, latest_user_message: Option<&str>) -> String {
-    match intent {
-        ToolChatIntent::CreateFile => {
-            let path = latest_user_message
-                .map(suggested_write_path_for_request)
-                .unwrap_or("/tmp/tool_output.txt");
-            format!(
-                "Your previous reply should have been a tool call. Retry now.\n\
-                Return only a single <tool_call> block in this exact shape:\n\
-                <tool_call>\n\
-                {{\"function\": {{\"name\": \"write_file\", \"arguments\": {{\"path\": \"{path}\", \"content\": \"...\"}}}}}}\n\
-                </tool_call>\n\
-                Do not ask the user to continue after the tool call. Do not reply with plain text before the tool call."
-            )
+        let map = cache.lock().unwrap();
+        if let Some(&cached) = map.get(model) {
+            return cached;
         }
-        ToolChatIntent::EditFile => "Your previous reply should have been a tool call. Retry now.\n\
-                Return only a single <tool_call> block in this exact shape:\n\
-                <tool_call>\n\
-                {\"function\": {\"name\": \"edit_file\", \"arguments\": {\"path\": \"/absolute/path\", \"old_string\": \"...\", \"new_string\": \"...\"}}}\n\
-                </tool_call>\n\
-                Do not reply with plain text before the tool call."
-            .to_string(),
-        ToolChatIntent::General => "Your previous reply should have been a tool call. Retry now and emit the appropriate tool call instead of plain text."
-            .to_string(),
     }
+    let client = shared_ollama_http_client();
+    let resp = client
+        .post(format!("{}/api/show", ollama_url))
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await;
+    let supports = match resp {
+        Ok(r) => {
+            let bytes = r.bytes().await.unwrap_or_default();
+            serde_json::from_slice::<OllamaShowResponse>(&bytes)
+                .ok()
+                .and_then(|s| s.capabilities)
+                .map(|caps| caps.iter().any(|c| c == "vision"))
+                .unwrap_or(false)
+        }
+        Err(_) => false,
+    };
+    let mut map = cache.lock().unwrap();
+    map.insert(model.to_string(), supports);
+    supports
 }
 
 pub fn get_coding_system_prompt() -> String {
-    "You are a coding assistant with filesystem tools.\n\
-    Use tools when you need to inspect files, create files, edit files, or run commands.\n\
-    If the user asks for a script, source file, or file edit, do not answer with prose first. Emit the tool call immediately.\n\
-    When using the text fallback, emit a single <tool_call>...</tool_call> block with valid JSON for the tool call.\n\
-    After tool results are returned, continue the task using those results.\n\
-    Do not tell the user to continue after a tool call; emit the tool call yourself."
+    "You are pj, a pragmatic coding agent working directly in the user's filesystem. \
+    You get real work done with tools instead of describing what could be done.\n\n\
+    Working rules:\n\
+    - Read before you edit: inspect relevant files with read_file/grep/glob so edits match reality.\n\
+    - Prefer edit_file with a unique old_string for targeted changes; use write_file only for new files or full rewrites.\n\
+    - After code changes, verify with run_command (build/test) when it makes sense.\n\
+    - Chain multiple tool calls autonomously to finish the task; execution is already gated by the UI, so never ask the user for permission between steps.\n\
+    - Keep prose short: report what you did, what changed, and anything the user must decide. No filler.\n\
+    If you cannot use tools for something, say so plainly."
         .to_string()
 }
 
@@ -794,16 +616,93 @@ pub fn build_messages_from_db(pool: &DbPool, chat_id: i64) -> Result<Vec<OllamaC
         content: get_coding_system_prompt(),
         tool_calls: None,
         name: None,
+        images: None,
     });
     for m in &db_msgs {
+        let tool_calls = m.tool_calls.clone().filter(|t| !t.is_empty());
+        if m.role == "assistant" && tool_calls.is_none() && m.content.trim().is_empty() {
+            continue;
+        }
         messages.push(OllamaChatMessage {
             role: m.role.clone(),
             content: m.content.clone(),
-            tool_calls: None,
+            tool_calls,
             name: None,
+            images: m.images.clone(),
         });
     }
     Ok(messages)
+}
+
+pub fn add_tool_result_message(
+    pool: &DbPool,
+    chat_id: i64,
+    tool_name: &str,
+    result: &str,
+) -> Result<(), String> {
+    add_message_with_name(pool, chat_id, "tool", result, Some(tool_name), None)
+}
+
+pub fn add_assistant_message_with_tools(
+    pool: &DbPool,
+    chat_id: i64,
+    text: &str,
+    tool_calls: &[ToolCall],
+) -> Result<(), String> {
+    let calls_json = serde_json::to_string(tool_calls).map_err(|e| format!("JSON: {e}"))?;
+    let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    conn.execute(
+        "INSERT INTO messages (chat_id, role, content, tool_calls) VALUES (?1, 'assistant', ?2, ?3)",
+        params![chat_id, text, calls_json],
+    )
+    .map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PendingToolCall {
+    pub tool_calls: Vec<ToolCall>,
+}
+
+pub fn save_pending_tools(pool: &DbPool, chat_id: i64, calls: &[ToolCall]) -> Result<(), String> {
+    let json = serde_json::to_string(&PendingToolCall {
+        tool_calls: calls.to_vec(),
+    })
+    .map_err(|e| format!("JSON: {e}"))?;
+    let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    conn.execute(
+        "INSERT INTO pending_tools (chat_id, tool_calls) VALUES (?1, ?2)
+         ON CONFLICT(chat_id) DO UPDATE SET tool_calls = excluded.tool_calls",
+        params![chat_id, json],
+    )
+    .map_err(|e| format!("{e}"))?;
+    Ok(())
+}
+
+pub fn load_pending_tools(pool: &DbPool, chat_id: i64) -> Result<Option<Vec<ToolCall>>, String> {
+    let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    let json: Option<String> = conn
+        .query_row(
+            "SELECT tool_calls FROM pending_tools WHERE chat_id = ?1",
+            params![chat_id],
+            |row| row.get(0),
+        )
+        .ok();
+    match json {
+        Some(j) => {
+            let parsed: PendingToolCall = serde_json::from_str(&j)
+                .map_err(|e| format!("Corrupt pending tools for chat {chat_id}: {e}"))?;
+            Ok(Some(parsed.tool_calls))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn delete_pending_tools(pool: &DbPool, chat_id: i64) -> Result<(), String> {
+    let conn = pool.get().map_err(|e| format!("Pool: {e}"))?;
+    conn.execute("DELETE FROM pending_tools WHERE chat_id = ?1", params![chat_id])
+        .map_err(|e| format!("{e}"))?;
+    Ok(())
 }
 
 pub async fn chat_with_ollama(
@@ -815,16 +714,8 @@ pub async fn chat_with_ollama(
     let client = shared_ollama_http_client();
 
     let url = format!("{}/api/chat", ollama_url);
-    let requested_tools = tools.clone();
     let mut active_tools = tools;
-    let mut working_messages = messages;
-    let latest_user_message = latest_user_message(&working_messages).map(str::to_string);
-    let intent = latest_user_message.as_deref()
-        .map(classify_tool_chat_intent)
-        .unwrap_or(ToolChatIntent::General);
-    let intent_already_satisfied =
-        tool_results_satisfy_intent(intent, &working_messages);
-    let mut corrected_tool_retries = 0u8;
+    let working_messages = messages;
 
     loop {
         let request = OllamaChatRequest {
@@ -862,74 +753,83 @@ pub async fn chat_with_ollama(
             let preview: String = text.chars().take(500).collect();
             format!("Failed to parse Ollama response ({e}): {preview}")
         })?;
-        let tool_calls = tools::normalize_tool_calls(&extract_tool_calls_from_response(&resp.message));
-        let clean_text = tools::strip_tool_calls_from_text(&resp.message.content);
-
-        if requested_tools.is_some()
-            && intent == ToolChatIntent::CreateFile
-            && !intent_already_satisfied
-            && !tool_calls_satisfy_intent(intent, &tool_calls)
-        {
-            let user_request = latest_user_message
-                .as_deref()
-                .ok_or("Missing user request for create-file tool synthesis.")?;
-            let synthesized_tool_call =
-                generate_create_file_tool_call(client, &url, model, user_request).await?;
-            return Ok(OllamaChatResponse {
-                message: OllamaChatMessage {
-                    role: resp.message.role,
-                    content: String::new(),
-                    tool_calls: Some(vec![tools::normalize_tool_call(&synthesized_tool_call)]),
-                    name: None,
-                },
-                done: resp.done,
-            });
-        }
-
-        if should_force_tool_retry(
-            requested_tools.is_some(),
-            intent,
-            intent_already_satisfied,
-            &tool_calls,
-            &clean_text,
-        ) {
-            if corrected_tool_retries >= 2 {
-                return Err(
-                    "Model failed to issue the required tool call for the requested file operation."
-                        .to_string(),
-                );
-            }
-
-            corrected_tool_retries += 1;
-            working_messages.push(OllamaChatMessage {
-                role: "assistant".to_string(),
-                content: clean_text,
-                tool_calls: None,
-                name: None,
-            });
-            working_messages.push(OllamaChatMessage {
-                role: "system".to_string(),
-                content: correction_message_for_intent(intent, latest_user_message.as_deref()),
-                tool_calls: None,
-                name: None,
-            });
-            active_tools = requested_tools.clone();
-            continue;
-        }
-
         return Ok(resp);
     }
 }
 
-pub type SessionMap = Arc<Mutex<HashMap<String, SessionState>>>;
-
-pub struct SessionState {
-    pub messages: Vec<OllamaChatMessage>,
-    pub chat_id: i64,
+pub enum TurnOutcome {
+    Reply(String),
+    PendingTools(Vec<ToolCall>),
 }
 
-pub fn generate_session_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    format!("s{:x}", nanos)
+pub async fn run_chat_turn(
+    pool: &DbPool,
+    ollama_url: &str,
+    model: &str,
+    chat_id: i64,
+) -> Result<TurnOutcome, String> {
+    let msgs = build_messages_from_db(pool, chat_id)?;
+    let resp = chat_with_ollama(ollama_url, model, msgs, Some(tools::get_tool_definitions())).await?;
+
+    let native_tcs = resp.message.tool_calls.clone().unwrap_or_default();
+    let clean_text = tools::strip_tool_calls_from_text(&resp.message.content);
+    let tool_calls = tools::normalize_tool_calls(&(if !native_tcs.is_empty() {
+        native_tcs
+    } else {
+        tools::parse_tool_calls_from_text(&resp.message.content)
+    }));
+
+    if tool_calls.is_empty() && clean_text.trim().is_empty() {
+        return Ok(TurnOutcome::Reply(String::new()));
+    }
+
+    if tool_calls.is_empty() {
+        add_message(pool, chat_id, "assistant", &clean_text, None)?;
+        publish_chat_change(&ChatChange::Upsert { id: chat_id }).ok();
+        return Ok(TurnOutcome::Reply(clean_text));
+    }
+
+    add_assistant_message_with_tools(pool, chat_id, &clean_text, &tool_calls)?;
+    save_pending_tools(pool, chat_id, &tool_calls)?;
+    publish_chat_change(&ChatChange::Upsert { id: chat_id }).ok();
+    publish_chat_change(&ChatChange::Activity {
+        id: chat_id,
+        state: ChatActivityState::AwaitingToolConfirmation,
+    })
+    .ok();
+    Ok(TurnOutcome::PendingTools(tool_calls))
+}
+
+pub async fn resolve_pending_tools(
+    pool: &DbPool,
+    ollama_url: &str,
+    model: &str,
+    chat_id: i64,
+    approved: bool,
+) -> Result<TurnOutcome, String> {
+    let calls = load_pending_tools(pool, chat_id)?.ok_or_else(|| {
+        format!("No pending tool calls for chat {chat_id} (already resolved elsewhere?)")
+    })?;
+    delete_pending_tools(pool, chat_id)?;
+
+    for tc in &calls {
+        let result = if approved {
+            match tools::execute_tool(tc) {
+                Ok(r) => r,
+                Err(e) => format!("Error: {e}"),
+            }
+        } else {
+            "User declined to execute this tool call.".to_string()
+        };
+        add_tool_result_message(pool, chat_id, &tc.function.name, &result)?;
+    }
+
+    publish_chat_change(&ChatChange::Upsert { id: chat_id }).ok();
+    publish_chat_change(&ChatChange::Activity {
+        id: chat_id,
+        state: ChatActivityState::Thinking,
+    })
+    .ok();
+
+    run_chat_turn(pool, ollama_url, model, chat_id).await
 }

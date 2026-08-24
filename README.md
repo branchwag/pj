@@ -2,7 +2,7 @@
 
 🎵 *Lift up the receiver, I'll make you a believer* 🎵
 
-A fully offline, local-first Rust AI chat app. Everything runs on your machine — the model via Ollama, the web UI, and the CLI. No telemetry, no external API calls, no cloud dependencies. All static assets (fonts, etc.) are bundled locally.
+A local-first Rust coding agent. The web UI and the CLI (fullscreen TUI or plain terminal) drive the same shared agent engine and the same SQLite database, so you can start a task in the browser, approve its tool calls from the terminal, and pick any chat back up in either surface. Inference runs through Ollama — fully offline with a local model, or via Ollama's cloud tier for bigger coding models. All static assets are bundled locally.
 
 ![Demo Screenshot](./pjdemo.png)
 
@@ -14,13 +14,13 @@ A fully offline, local-first Rust AI chat app. Everything runs on your machine �
 
 2. **Pull a model** (or use the default via presets):
    ```bash
-   ollama pull qwen2.5:3b
+   ollama pull gpt-oss:120b-cloud
    ```
 
 3. **Set environment variables** (all optional):
    ```bash
    export OLLAMA_URL=http://localhost:11434
-   export MODEL_PRESET=balanced   # speed | balanced (default) | quality
+   export MODEL_PRESET=balanced   # speed | balanced (default) | quality | local-*
    export PORT=8080
    ```
    Or override the model directly:
@@ -40,11 +40,16 @@ A fully offline, local-first Rust AI chat app. Everything runs on your machine �
 
 pj supports model presets for easy speed/quality tuning. Set `MODEL_PRESET` to choose one:
 
-| Preset      | Model         | Notes                                     |
-|-------------|---------------|-------------------------------------------|
-| `speed`     | qwen2.5:1.5b  | Fastest responses, lowest quality         |
-| `balanced`  | qwen2.5:3b    | Good speed/quality tradeoff (default)     |
-| `quality`   | qwen2.5:7b    | Best quality, slower on CPU               |
+| Preset           | Model              | Notes                                              |
+|------------------|--------------------|----------------------------------------------------|
+| `speed`          | gpt-oss:20b-cloud  | Fast free cloud model with solid tool calling      |
+| `balanced`       | gpt-oss:120b-cloud | Strong open coding model, Ollama cloud free tier (default) |
+| `quality`        | minimax-m3:cloud   | Agentic cloud model with 1M token context          |
+| `local-speed`    | qwen2.5:1.5b       | Local, fully offline, fastest                      |
+| `local-balanced` | qwen2.5:3b         | Local, offline, balanced                           |
+| `local-quality`  | qwen2.5:7b         | Local, offline, best quality                       |
+
+Cloud models run through your local Ollama (it proxies to ollama.com; run `ollama signin` once). The free tier covers the three cloud presets above.
 
 `MODEL_NAME` always takes precedence over `MODEL_PRESET` if both are set.
 

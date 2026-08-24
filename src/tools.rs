@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -27,35 +27,37 @@ pub struct ToolCallFunction {
     pub arguments: serde_json::Value,
 }
 
-fn default_tmp_tool_path(name_hint: &str) -> String {
-    let cleaned = name_hint
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let trimmed = cleaned.trim_matches('_');
-    let basename = if trimmed.is_empty() { "tool_output.txt" } else { trimmed };
-    format!("/tmp/{basename}")
+const MAX_TOOL_OUTPUT_BYTES: usize = 30_000;
+
+fn truncate_output(output: &str) -> String {
+    if output.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return output.to_string();
+    }
+    let head: String = output.chars().take(MAX_TOOL_OUTPUT_BYTES / 2).collect();
+    let tail_start = output.chars().count().saturating_sub(MAX_TOOL_OUTPUT_BYTES / 2);
+    let tail: String = output.chars().skip(tail_start).collect();
+    format!(
+        "{head}\n\n[... output truncated, {truncated} characters omitted ...]\n\n{tail}",
+        truncated = output.len() - head.len() - tail.len()
+    )
 }
 
-fn normalize_write_path(path: Option<&str>) -> String {
-    match path.map(str::trim).filter(|p| !p.is_empty()) {
-        Some(raw) if Path::new(raw).is_absolute() => raw.to_string(),
-        Some(raw) => {
-            let candidate = PathBuf::from(raw);
-            candidate
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(default_tmp_tool_path)
-                .unwrap_or_else(|| default_tmp_tool_path(raw))
+fn absolute_path(path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_string_lossy().to_string()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
+            Err(_) => p.to_string_lossy().to_string(),
         }
-        None => default_tmp_tool_path("tool_output.txt"),
     }
+}
+
+fn cwd_display() -> String {
+    std::env::current_dir()
+        .map(|d| d.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string())
 }
 
 pub fn normalize_tool_call(tool_call: &ToolCall) -> ToolCall {
@@ -65,25 +67,15 @@ pub fn normalize_tool_call(tool_call: &ToolCall) -> ToolCall {
         return normalized;
     }
 
-    if let Some(args) = normalized.function.arguments.as_object_mut() {
-        let current_path = args.get("path").and_then(|v| v.as_str());
-        let normalized_path = if name == "write_file" {
-            Some(normalize_write_path(current_path))
-        } else {
-            current_path.and_then(|path| {
-                let trimmed = path.trim();
-                if trimmed.is_empty() {
-                    None
-                } else if Path::new(trimmed).is_absolute() {
-                    Some(trimmed.to_string())
-                } else {
-                    None
-                }
-            })
-        };
-
-        if let Some(path) = normalized_path {
-            args.insert("path".to_string(), serde_json::Value::String(path));
+    if let Some(args) = normalized.function.arguments.as_object_mut()
+        && let Some(path) = args.get("path").and_then(|v| v.as_str())
+    {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            args.insert(
+                "path".to_string(),
+                serde_json::Value::String(absolute_path(trimmed)),
+            );
         }
     }
 
@@ -100,11 +92,13 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: ToolFunction {
                 name: "read_file".to_string(),
-                description: "Read the contents of a file from the filesystem".to_string(),
+                description: "Read a file with numbered lines. For large files, use offset/limit to read sections. Always read before editing.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Absolute path to the file" }
+                        "path": { "type": "string", "description": "Path to the file (absolute, or relative to the working directory)" },
+                        "offset": { "type": "integer", "description": "1-based line number to start reading from (default: 1)" },
+                        "limit": { "type": "integer", "description": "Maximum number of lines to read (default: 2000)" }
                     },
                     "required": ["path"]
                 }),
@@ -114,11 +108,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: ToolFunction {
                 name: "write_file".to_string(),
-                description: "Write content to a file (overwrites existing content, creates parent directories)".to_string(),
+                description: "Write content to a file, overwriting it and creating parent directories. Use for new files or complete rewrites only; prefer edit_file for targeted changes.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Absolute path to the file" },
+                        "path": { "type": "string", "description": "Path to the file (absolute, or relative to the working directory)" },
                         "content": { "type": "string", "description": "Content to write" }
                     },
                     "required": ["path", "content"]
@@ -129,13 +123,14 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: ToolFunction {
                 name: "edit_file".to_string(),
-                description: "Edit a file by replacing exact text matches. Use for targeted edits.".to_string(),
+                description: "Replace an exact unique text match in a file. old_string must appear exactly once unless replace_all is true; include surrounding lines to make it unique.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Absolute path to the file" },
-                        "old_string": { "type": "string", "description": "Text to search for (exact match)" },
-                        "new_string": { "type": "string", "description": "Text to replace with" }
+                        "path": { "type": "string", "description": "Path to the file (absolute, or relative to the working directory)" },
+                        "old_string": { "type": "string", "description": "Text to search for (exact match, must be unique in the file)" },
+                        "new_string": { "type": "string", "description": "Replacement text" },
+                        "replace_all": { "type": "boolean", "description": "Replace every occurrence instead of failing on multiple matches (default: false)" }
                     },
                     "required": ["path", "old_string", "new_string"]
                 }),
@@ -145,11 +140,12 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: ToolFunction {
                 name: "run_command".to_string(),
-                description: "Run a shell command via `sh -c`. Output is captured and returned.".to_string(),
+                description: "Run a shell command via `sh -c` and capture stdout/stderr plus the exit code. Use for builds, tests, git, and other verification. Times out if a command hangs.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "Shell command to execute" }
+                        "command": { "type": "string", "description": "Shell command to execute" },
+                        "timeout_secs": { "type": "integer", "description": "Timeout in seconds (default 120, max 600)" }
                     },
                     "required": ["command"]
                 }),
@@ -159,11 +155,12 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: ToolFunction {
                 name: "glob".to_string(),
-                description: "Find files and directories matching a glob pattern".to_string(),
+                description: "Find files matching a glob pattern, sorted by modification time (newest first). Pattern like '**/*.rs'.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Glob pattern (e.g. '**/*.rs')" }
+                        "pattern": { "type": "string", "description": "Glob pattern (e.g. 'src/**/*.rs')" },
+                        "path": { "type": "string", "description": "Base directory to search from (default: working directory)" }
                     },
                     "required": ["pattern"]
                 }),
@@ -173,12 +170,13 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: ToolFunction {
                 name: "grep".to_string(),
-                description: "Search file contents using a regex pattern. Uses ripgrep if available, falls back to grep.".to_string(),
+                description: "Search file contents with a regex. Uses ripgrep if available, falls back to grep. Returns file:line:match rows.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "pattern": { "type": "string", "description": "Regex pattern to search" },
-                        "path": { "type": "string", "description": "Directory or file to search (default: current directory)" }
+                        "path": { "type": "string", "description": "Directory or file to search (default: working directory)" },
+                        "include": { "type": "string", "description": "Glob filter for files to search (e.g. '*.rs')" }
                     },
                     "required": ["pattern"]
                 }),
@@ -188,11 +186,11 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: ToolFunction {
                 name: "read_directory".to_string(),
-                description: "List the contents of a directory".to_string(),
+                description: "List a directory's entries; directories get a trailing slash.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Absolute path to the directory" }
+                        "path": { "type": "string", "description": "Path to the directory (absolute, or relative to the working directory)" }
                     },
                     "required": ["path"]
                 }),
@@ -208,79 +206,248 @@ pub fn execute_tool(tool_call: &ToolCall) -> Result<String, String> {
     match name.as_str() {
         "read_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).ok_or("missing path")?;
-            std::fs::read_to_string(path).map_err(|e| format!("read_file error: {e}"))
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| format!("read_file error: {e}"))?;
+            let total_lines = content.lines().count();
+            let offset = args
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.max(1) as usize - 1)
+                .unwrap_or(0);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.max(1) as usize)
+                .unwrap_or(2000);
+            let selected: Vec<&str> = content
+                .lines()
+                .skip(offset)
+                .take(limit)
+                .collect();
+            let mut out = String::new();
+            for (i, line) in selected.iter().enumerate() {
+                out.push_str(&format!("{:>6}\t{}\n", offset + i + 1, line));
+            }
+            if out.len() > MAX_TOOL_OUTPUT_BYTES {
+                let cut: String = out.chars().take(MAX_TOOL_OUTPUT_BYTES).collect();
+                out = format!("{cut}\n[... file truncated ...]");
+            }
+            let range_note = format!(
+                "\n[{showing} of {total} total lines]",
+                showing = selected.len(),
+                total = total_lines
+            );
+            out.push_str(&range_note);
+            Ok(out)
         }
         "write_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).ok_or("missing path")?;
             let content = args.get("content").and_then(|v| v.as_str()).ok_or("missing content")?;
-            if let Some(parent) = std::path::Path::new(path).parent() {
+            if let Some(parent) = Path::new(path).parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("write_file mkdir error: {e}"))?;
             }
             std::fs::write(path, content).map_err(|e| format!("write_file error: {e}"))?;
-            Ok(format!("ok wrote {} bytes to {}", content.len(), path))
+            Ok(format!(
+                "wrote {} bytes to {}",
+                content.len(),
+                path
+            ))
         }
         "edit_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).ok_or("missing path")?;
             let old = args.get("old_string").and_then(|v| v.as_str()).ok_or("missing old_string")?;
             let new = args.get("new_string").and_then(|v| v.as_str()).ok_or("missing new_string")?;
-            let content = std::fs::read_to_string(path).map_err(|e| format!("edit_file read error: {e}"))?;
-            if !content.contains(old) {
-                return Err(format!("no match found in {path}"));
+            let replace_all = args
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if old == new {
+                return Err("old_string and new_string are identical; nothing to change".to_string());
             }
-            let new_content = content.replace(old, new);
-            std::fs::write(path, new_content).map_err(|e| format!("edit_file write error: {e}"))?;
-            Ok("ok edited successfully".to_string())
+            let content =
+                std::fs::read_to_string(path).map_err(|e| format!("edit_file read error: {e}"))?;
+            let occurrences = content.matches(old).count();
+            if occurrences == 0 {
+                return Err(format!(
+                    "old_string not found in {path}. Re-read the file and include enough surrounding lines to match exactly."
+                ));
+            }
+            if occurrences > 1 && !replace_all {
+                return Err(format!(
+                    "old_string matches {occurrences} locations in {path}; it must be unique. Add surrounding lines to disambiguate or set replace_all=true."
+                ));
+            }
+            let new_content = if replace_all {
+                content.replace(old, new)
+            } else {
+                content.replacen(old, new, 1)
+            };
+            std::fs::write(path, new_content)
+                .map_err(|e| format!("edit_file write error: {e}"))?;
+            Ok(format!(
+                "edited {path}: replaced {replaced} occurrence(s)",
+                replaced = if replace_all { occurrences } else { 1 }
+            ))
         }
         "run_command" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).ok_or("missing command")?;
-            let output = std::process::Command::new("sh")
+            let timeout_secs = args
+                .get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .map(|v| v.clamp(1, 600))
+                .unwrap_or(120);
+            let start = std::time::Instant::now();
+            let mut child = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(cmd)
-                .output()
-                .map_err(|e| format!("run_command error: {e}"))?;
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("run_command spawn error: {e}"))?;
+
+            fn drain<T: std::io::Read>(pipe: Option<T>) -> String {
+                let mut buf = String::new();
+                if let Some(mut p) = pipe {
+                    let _ = std::io::Read::read_to_string(&mut p, &mut buf);
+                }
+                buf
+            }
+
+            let stdout_pipe = child.stdout.take();
+            let stderr_pipe = child.stderr.take();
+            let out_reader = std::thread::spawn(move || drain(stdout_pipe));
+            let err_reader = std::thread::spawn(move || drain(stderr_pipe));
+
+            let deadline = start + std::time::Duration::from_secs(timeout_secs);
+            let status = loop {
+                match child.try_wait().map_err(|e| format!("run_command wait error: {e}"))? {
+                    Some(status) => break status,
+                    None => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let partial_out = out_reader.join().unwrap_or_default();
+                            let partial_err = err_reader.join().unwrap_or_default();
+                            let mut partial = String::new();
+                            if !partial_out.trim().is_empty() {
+                                partial.push_str(partial_out.trim_end());
+                            }
+                            if !partial_err.trim().is_empty() {
+                                if !partial.is_empty() {
+                                    partial.push('\n');
+                                }
+                                partial.push_str(partial_err.trim_end());
+                            }
+                            let note = if partial.trim().is_empty() {
+                                "no output was produced".to_string()
+                            } else {
+                                format!("output so far:\n{}", truncate_output(partial.trim()))
+                            };
+                            return Err(format!(
+                                "command timed out after {timeout_secs}s and was killed; {note}"
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            };
+
+            let stdout = out_reader.join().unwrap_or_default();
+            let stderr = err_reader.join().unwrap_or_default();
             let mut result = String::new();
-            if !output.stdout.is_empty() {
-                result.push_str(&String::from_utf8_lossy(&output.stdout));
+            if !stdout.trim().is_empty() {
+                result.push_str(stdout.trim_end());
             }
-            if !output.stderr.is_empty() {
-                if !result.is_empty() { result.push('\n'); }
-                result.push_str(&String::from_utf8_lossy(&output.stderr));
+            if !stderr.trim().is_empty() {
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+                result.push_str(stderr.trim_end());
             }
-            if result.is_empty() {
-                result = format!("exit code: {:?}", output.status.code());
-            }
-            Ok(result)
+            result.push_str(&format!(
+                "\nexit code: {} ({:.1}s)",
+                status.code().unwrap_or(-1),
+                start.elapsed().as_secs_f32()
+            ));
+            Ok(truncate_output(&result))
         }
         "glob" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).ok_or("missing pattern")?;
-            let entries = glob::glob(pattern).map_err(|e| format!("glob error: {e}"))?;
-            let mut paths: Vec<String> = entries.filter_map(|e| e.ok()).map(|p| p.display().to_string()).collect();
-            paths.sort();
-            if paths.is_empty() { Ok("no matches".to_string()) }
-            else { Ok(paths.join("\n")) }
+            let base = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(absolute_path)
+                .unwrap_or_else(cwd_display);
+            let full_pattern = if Path::new(pattern).is_absolute() {
+                pattern.to_string()
+            } else {
+                format!("{}/{}", base.trim_end_matches('/'), pattern)
+            };
+            let entries = glob::glob(&full_pattern).map_err(|e| format!("glob error: {e}"))?;
+            let mut paths: Vec<(std::time::SystemTime, String)> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|p| {
+                    let meta = p.metadata().ok()?;
+                    let mtime = meta.modified().ok()?;
+                    Some((mtime, p.display().to_string()))
+                })
+                .collect();
+            paths.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+            if paths.is_empty() {
+                return Ok("no matches".to_string());
+            }
+            let truncated = paths.len() > 1000;
+            let list: Vec<String> = paths
+                .into_iter()
+                .take(1000)
+                .map(|(_, p)| p)
+                .collect();
+            let mut out = list.join("\n");
+            if truncated {
+                out.push_str("\n[... more than 1000 matches, showing newest 1000 ...]");
+            }
+            Ok(truncate_output(&out))
         }
         "grep" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).ok_or("missing pattern")?;
-            let search_path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            let result = std::process::Command::new("rg")
-                .args(["-n", pattern, search_path])
-                .output();
-            let output = match result {
+            let search_path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(absolute_path)
+                .unwrap_or_else(cwd_display);
+            let include = args.get("include").and_then(|v| v.as_str());
+
+            let mut rg_result = std::process::Command::new("rg");
+            rg_result.args(["-n", "--no-heading"]).arg(pattern).arg(&search_path);
+            match include {
+                Some(glob_filter) => rg_result.args(["-g", glob_filter]),
+                None => &mut rg_result,
+            };
+            let rg_result = rg_result.output();
+
+            let output = match rg_result {
                 Ok(o) if o.status.success() || o.status.code() == Some(1) => o,
                 _ => {
-                    std::process::Command::new("grep")
-                        .args(["-rn", pattern, search_path])
-                        .output()
-                        .map_err(|e| format!("grep error: {e}"))?
+                    let grep_cmd = match include {
+                        Some(glob_filter) => vec!["-rn".to_string(), format!("--include={glob_filter}")],
+                        None => vec!["-rn".to_string()],
+                    };
+                    let mut c = std::process::Command::new("grep");
+                    c.args(&grep_cmd);
+                    c.arg(pattern).arg(&search_path);
+                    c.output().map_err(|e| format!("grep error: {e}"))?
                 }
             };
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if stdout.is_empty() { Ok("no matches".to_string()) }
-            else { Ok(stdout.trim().to_string()) }
+            if stdout.trim().is_empty() {
+                return Ok("no matches".to_string());
+            }
+            Ok(truncate_output(stdout.trim()))
         }
         "read_directory" => {
             let dir = args.get("path").and_then(|v| v.as_str()).ok_or("missing path")?;
-            let entries = std::fs::read_dir(dir).map_err(|e| format!("read_dir error: {e}"))?;
+            let dir_abs = absolute_path(dir);
+            let entries = std::fs::read_dir(&dir_abs).map_err(|e| format!("read_dir error: {e}"))?;
             let mut items: Vec<String> = entries
                 .filter_map(|e| e.ok())
                 .map(|e| {
@@ -293,8 +460,11 @@ pub fn execute_tool(tool_call: &ToolCall) -> Result<String, String> {
                 })
                 .collect();
             items.sort();
-            if items.is_empty() { Ok("empty directory".to_string()) }
-            else { Ok(items.join("\n")) }
+            if items.is_empty() {
+                Ok("empty directory".to_string())
+            } else {
+                Ok(truncate_output(&items.join("\n")))
+            }
         }
         _ => Err(format!("unknown tool: {name}")),
     }
@@ -342,9 +512,29 @@ pub fn strip_tool_calls_from_text(text: &str) -> String {
             break;
         }
     }
-    result.trim().to_string()
+    let stripped = result.trim().to_string();
+    strip_think_tags(&stripped)
 }
 
+fn strip_think_tags(text: &str) -> String {
+    let mut result = String::new();
+    let mut pos = 0;
+    loop {
+        let remaining = &text[pos..];
+        if let Some(start) = remaining.find("<think>") {
+            result.push_str(&text[pos..pos + start]);
+            if let Some(end) = remaining[start..].find("</think>") {
+                pos = pos + start + end + "</think>".len();
+            } else {
+                break;
+            }
+        } else {
+            result.push_str(remaining);
+            break;
+        }
+    }
+    result.trim().to_string()
+}
 #[derive(Debug, Clone)]
 pub struct CodeBlock {
     pub language: String,
@@ -394,7 +584,18 @@ pub fn tool_call_description(tool_call: &ToolCall) -> String {
             format!("Write file: {} ({} bytes)\n  {}{}", g("path"), content.len(), preview, ellipsis)
         }
         "edit_file" => {
-            format!("Edit file: {}\n  Replace: {}\n  With:    {}", g("path"), g("old_string"), g("new_string"))
+            let replace_all = args
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mode = if replace_all { " (all)" } else { "" };
+            format!(
+                "Edit file{}: {}\n  Replace: {}\n  With:    {}",
+                mode,
+                g("path"),
+                g("old_string"),
+                g("new_string")
+            )
         }
         "run_command" => format!("Run: {}", g("command")),
         "glob" => format!("Glob: {}", g("pattern")),

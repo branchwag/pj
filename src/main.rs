@@ -4,20 +4,11 @@ use actix_web::middleware::DefaultHeaders;
 use actix_web::{web, App, HttpResponse, HttpServer, Result};
 use futures::stream::StreamExt;
 use log::info;
-use pj::tools::{self, ToolCall};
 use pj::*;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use tokio::sync::broadcast;
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-
-type SessionMap = Arc<Mutex<HashMap<String, SessionState>>>;
-
-fn session_store() -> SessionMap {
-    Arc::new(Mutex::new(HashMap::new()))
-}
 
 async fn handle_list_chats(pool: web::Data<DbPool>) -> Result<HttpResponse> {
     let pool = pool.get_ref().clone();
@@ -84,6 +75,13 @@ async fn handle_chat(
     info!("Processing chat request for chat_id={:?}, message={}", chat_id, message);
 
     let chat_id = if let Some(id) = chat_id {
+        let exists =
+            chat_exists(&pool, id).map_err(actix_web::error::ErrorInternalServerError)?;
+        if !exists {
+            return Err(actix_web::error::ErrorBadRequest(format!(
+                "chat {id} not found"
+            )));
+        }
         id
     } else {
         let pool = pool.clone();
@@ -108,7 +106,7 @@ async fn handle_chat(
 
     let pool_c = pool.clone();
     let msg_c = message.clone();
-    web::block(move || add_message(&pool_c, chat_id, "user", &msg_c))
+    web::block(move || add_message(&pool_c, chat_id, "user", &msg_c, None))
         .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
         .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -171,7 +169,7 @@ async fn handle_chat(
 
                 if !full_response.is_empty() {
                     tokio::task::spawn_blocking(move || {
-                        add_message(&pool2, chat_id2, "assistant", &full_response).ok();
+                        add_message(&pool2, chat_id2, "assistant", &full_response, None).ok();
                     })
                     .await
                     .ok();
@@ -204,12 +202,13 @@ async fn handle_chat(
     }
 }
 
-// ── Tool-enabled chat (prompt-based) ──
+// ── Tool-enabled chat (shared agent engine) ──
 
 #[derive(Deserialize)]
 pub struct ToolChatRequest {
     pub chat_id: Option<i64>,
     pub message: String,
+    pub images: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -217,138 +216,102 @@ pub struct ToolChatResponse {
     pub r#type: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub tool_calls: Option<Vec<tools::ToolCall>>,
     pub chat_id: i64,
 }
 
 #[derive(Deserialize)]
 pub struct ToolConfirmRequest {
-    pub session_id: String,
+    pub chat_id: i64,
     pub approved: bool,
-    pub modified_paths: Option<Vec<ModifiedPath>>,
 }
 
-#[derive(Deserialize, Clone)]
-pub struct ModifiedPath {
-    pub index: usize,
-    pub path: String,
+fn ensure_chat(pool: &DbPool, chat_id: Option<i64>, first_message: &str) -> Result<i64> {
+    match chat_id {
+        Some(id) => {
+            let exists = chat_exists(pool, id).map_err(actix_web::error::ErrorInternalServerError)?;
+            if exists {
+                Ok(id)
+            } else {
+                Err(actix_web::error::ErrorBadRequest(format!(
+                    "chat {id} not found"
+                )))
+            }
+        }
+        None => create_chat(pool)
+            .map_err(actix_web::error::ErrorInternalServerError)
+            .map(|c| {
+                let _ = update_title_from_message(pool, c.id, first_message);
+                c.id
+            }),
+    }
+}
+
+fn turn_response(chat_id: i64, outcome: TurnOutcome) -> HttpResponse {
+    match outcome {
+        TurnOutcome::Reply(text) => HttpResponse::Ok().json(ToolChatResponse {
+            r#type: "text".to_string(),
+            content: text,
+            tool_calls: None,
+            chat_id,
+        }),
+        TurnOutcome::PendingTools(calls) => HttpResponse::Ok().json(ToolChatResponse {
+            r#type: "tool_calls".to_string(),
+            content: String::new(),
+            tool_calls: Some(calls),
+            chat_id,
+        }),
+    }
 }
 
 async fn handle_tool_chat(
     req: web::Json<ToolChatRequest>,
     pool: web::Data<DbPool>,
-    sessions: web::Data<SessionMap>,
     event_tx: web::Data<broadcast::Sender<ChatChange>>,
 ) -> Result<HttpResponse> {
     let ollama_url = ollama_url();
     let model = model_name();
     let message = req.message.clone();
+    let images = req.images.clone();
     let pool = pool.get_ref().clone();
 
-    let chat_id = if let Some(id) = req.chat_id {
-        id
-    } else {
-        let pool = pool.clone();
-        let title: String = message.chars().take(50).collect();
-        web::block(move || {
-            let conn = pool.get().unwrap();
-            conn.execute("INSERT INTO chats (title) VALUES (?1)", params![title])?;
-            Ok(conn.last_insert_rowid())
-        })
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
-        .map_err(|e: rusqlite::Error| actix_web::error::ErrorInternalServerError(e))?
-    };
+    let has_images = images.as_ref().is_some_and(|i| !i.is_empty());
+    let vision = model_supports_vision(&ollama_url, &model).await;
+    log::info!("handle_tool_chat: model={}, has_images={}, supports_vision={}", model, has_images, vision);
 
-    let pool_c = pool.clone();
-    let msg = message.clone();
-    web::block(move || update_title_from_message(&pool_c, chat_id, &msg))
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+    if has_images && !vision {
+        let chat_id = ensure_chat(&pool, req.chat_id, &message)?;
+        add_message(&pool, chat_id, "user", &message, None)
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let reply = format!(
+            "I can't read images — the current model '{}' doesn't support vision. \
+             Switch to a vision-capable model (e.g. llava, bakllava, llava-phi3) to send images.",
+            model
+        );
+        add_message(&pool, chat_id, "assistant", &reply, None)
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        let _ = event_tx.send(ChatChange::Upsert { id: chat_id });
+        return Ok(HttpResponse::Ok().json(ToolChatResponse {
+            r#type: "text".to_string(),
+            content: reply,
+            tool_calls: None,
+            chat_id,
+        }));
+    }
+
+    let chat_id = ensure_chat(&pool, req.chat_id, &message)?;
     let _ = event_tx.send(ChatChange::Upsert { id: chat_id });
 
-    let pool_c = pool.clone();
-    let msg = message.clone();
-    web::block(move || add_message(&pool_c, chat_id, "user", &msg))
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
-        .map_err(actix_web::error::ErrorInternalServerError)?;
-
-    let pool_db = pool.clone();
-    let all_msgs = web::block(move || build_messages_from_db(&pool_db, chat_id))
-        .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
+    add_message(&pool, chat_id, "user", &message, images.as_deref())
         .map_err(actix_web::error::ErrorInternalServerError)?;
     let _ = event_tx.send(ChatChange::Activity {
         id: chat_id,
         state: ChatActivityState::Thinking,
     });
+    let _ = event_tx.send(ChatChange::Upsert { id: chat_id });
 
-    let tools = Some(tools::get_tool_definitions());
-    match chat_with_ollama(&ollama_url, &model, all_msgs.clone(), tools).await {
-        Ok(resp) => {
-            let native_tcs = resp.message.tool_calls.clone().unwrap_or_default();
-            let text = &resp.message.content;
-            let parsed_tcs = tools::parse_tool_calls_from_text(text);
-            let clean_text = tools::strip_tool_calls_from_text(text);
-
-            let tool_calls = tools::normalize_tool_calls(&(if !native_tcs.is_empty() {
-                native_tcs
-            } else {
-                parsed_tcs
-            }));
-
-            if !clean_text.is_empty() && tool_calls.is_empty() {
-                let pool_s = pool.clone();
-                let ct = clean_text.clone();
-                web::block(move || add_message(&pool_s, chat_id, "assistant", &ct))
-                    .await
-                    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
-                    .map_err(actix_web::error::ErrorInternalServerError)?;
-                let _ = event_tx.send(ChatChange::Upsert { id: chat_id });
-            }
-
-            if tool_calls.is_empty() {
-                let _ = event_tx.send(ChatChange::Activity {
-                    id: chat_id,
-                    state: ChatActivityState::Idle,
-                });
-                Ok(HttpResponse::Ok().json(ToolChatResponse {
-                    r#type: "text".to_string(),
-                    content: clean_text,
-                    tool_calls: None,
-                    session_id: None,
-                    chat_id,
-                }))
-            } else {
-                let mut context = all_msgs;
-                context.push(OllamaChatMessage {
-                    role: "assistant".to_string(),
-                    content: clean_text.clone(),
-                    tool_calls: Some(tool_calls.clone()),
-                    name: None,
-                });
-
-                let session_id = generate_session_id();
-                let mut map = sessions.lock().unwrap();
-                map.insert(session_id.clone(), SessionState { messages: context, chat_id });
-                let _ = event_tx.send(ChatChange::Activity {
-                    id: chat_id,
-                    state: ChatActivityState::AwaitingToolConfirmation,
-                });
-
-                Ok(HttpResponse::Ok().json(ToolChatResponse {
-                    r#type: "tool_calls".to_string(),
-                    content: clean_text,
-                    tool_calls: Some(tool_calls),
-                    session_id: Some(session_id),
-                    chat_id,
-                }))
-            }
-        }
+    match run_chat_turn(&pool, &ollama_url, &model, chat_id).await {
+        Ok(outcome) => Ok(turn_response(chat_id, outcome)),
         Err(e) => {
             log::error!("Ollama error: {}", e);
             let _ = event_tx.send(ChatChange::Activity {
@@ -365,160 +328,41 @@ async fn handle_tool_chat(
 async fn handle_tool_confirm(
     req: web::Json<ToolConfirmRequest>,
     pool: web::Data<DbPool>,
-    sessions: web::Data<SessionMap>,
     event_tx: web::Data<broadcast::Sender<ChatChange>>,
 ) -> Result<HttpResponse> {
     let ollama_url = ollama_url();
     let model = model_name();
     let pool = pool.get_ref().clone();
+    let chat_id = req.chat_id;
 
-    let state = {
-        let mut map = sessions.lock().unwrap();
-        match map.remove(&req.session_id) {
-            Some(s) => s,
-            None => {
-                return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": "Session expired"
-                })));
-            }
-        }
-    };
-
-    // Parse tool calls from the session (from the last assistant message's tool_calls field or text fallback)
-    let all_tool_calls: Vec<ToolCall> = state
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "assistant")
-        .and_then(|m| {
-            m.tool_calls
-                .clone()
-                .filter(|t| !t.is_empty())
-                .or_else(|| {
-                    let parsed = tools::parse_tool_calls_from_text(&m.content);
-                    if parsed.is_empty() { None } else { Some(parsed) }
-                })
-        })
-        .unwrap_or_default();
-
-    if all_tool_calls.is_empty() {
-        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-            "error": "No tool calls found in session"
-        })));
-    }
-
-    let mut tool_calls = all_tool_calls;
-    if let Some(ref paths) = req.modified_paths {
-        for mp in paths {
-            if mp.index < tool_calls.len()
-                && let Some(args) = tool_calls[mp.index].function.arguments.as_object_mut()
-            {
-                args.insert("path".to_string(), serde_json::Value::String(mp.path.clone()));
-            }
-        }
-    }
-
-    let mut extra = state.messages;
-
-    if req.approved {
-        for tc in &tool_calls {
-            let result = match tools::execute_tool(tc) {
-                Ok(r) => r,
-                Err(e) => format!("Error: {e}"),
-            };
-            extra.push(OllamaChatMessage {
-                role: "tool".to_string(),
-                content: result,
-                tool_calls: None,
-                name: Some(tc.function.name.clone()),
-            });
-        }
-    } else {
-        extra.push(OllamaChatMessage {
-            role: "tool".to_string(),
-            content: "The user declined to execute this tool call.".to_string(),
-            tool_calls: None,
-            name: Some(tool_calls[0].function.name.clone()),
-        });
-    }
     let _ = event_tx.send(ChatChange::Activity {
-        id: state.chat_id,
+        id: chat_id,
         state: ChatActivityState::Thinking,
     });
 
-    let tools = Some(tools::get_tool_definitions());
-    match chat_with_ollama(&ollama_url, &model, extra.clone(), tools).await {
-        Ok(resp) => {
-            let native_tcs = resp.message.tool_calls.clone().unwrap_or_default();
-            let text = &resp.message.content;
-            let parsed_tcs = tools::parse_tool_calls_from_text(text);
-            let clean_text = tools::strip_tool_calls_from_text(text);
-
-            let tool_calls = tools::normalize_tool_calls(&(if !native_tcs.is_empty() {
-                native_tcs
-            } else {
-                parsed_tcs
-            }));
-
-            if !clean_text.is_empty() {
-                let pool_s = pool.clone();
-                let ct = clean_text.clone();
-                web::block(move || add_message(&pool_s, state.chat_id, "assistant", &ct))
-                    .await
-                    .map_err(|e| actix_web::error::ErrorInternalServerError(format!("DB: {e}")))?
-                    .map_err(actix_web::error::ErrorInternalServerError)?;
-                let _ = event_tx.send(ChatChange::Upsert { id: state.chat_id });
-            }
-
-            if tool_calls.is_empty() {
-                let _ = event_tx.send(ChatChange::Activity {
-                    id: state.chat_id,
-                    state: ChatActivityState::Idle,
-                });
-                Ok(HttpResponse::Ok().json(ToolChatResponse {
-                    r#type: "text".to_string(),
-                    content: clean_text,
-                    tool_calls: None,
-                    session_id: None,
-                    chat_id: state.chat_id,
-                }))
-            } else {
-                let mut context = extra;
-                context.push(OllamaChatMessage {
-                    role: "assistant".to_string(),
-                    content: clean_text.clone(),
-                    tool_calls: Some(tool_calls.clone()),
-                    name: None,
-                });
-
-                let session_id = generate_session_id();
-                let mut map = sessions.lock().unwrap();
-                map.insert(session_id.clone(), SessionState { messages: context, chat_id: state.chat_id });
-                let _ = event_tx.send(ChatChange::Activity {
-                    id: state.chat_id,
-                    state: ChatActivityState::AwaitingToolConfirmation,
-                });
-
-                Ok(HttpResponse::Ok().json(ToolChatResponse {
-                    r#type: "tool_calls".to_string(),
-                    content: clean_text,
-                    tool_calls: Some(tool_calls),
-                    session_id: Some(session_id),
-                    chat_id: state.chat_id,
-                }))
-            }
-        }
+    match resolve_pending_tools(&pool, &ollama_url, &model, chat_id, req.approved).await {
+        Ok(outcome) => Ok(turn_response(chat_id, outcome)),
         Err(e) => {
-            log::error!("Ollama error: {}", e);
+            log::error!("Tool confirm error: {}", e);
             let _ = event_tx.send(ChatChange::Activity {
-                id: state.chat_id,
+                id: chat_id,
                 state: ChatActivityState::Idle,
             });
             Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Ollama error: {e}")
+                "error": format!("{e}")
             })))
         }
     }
+}
+
+async fn handle_get_pending_tools(
+    path: web::Path<i64>,
+    pool: web::Data<DbPool>,
+) -> Result<HttpResponse> {
+    let chat_id = path.into_inner();
+    let pending =
+        load_pending_tools(pool.get_ref(), chat_id).map_err(actix_web::error::ErrorInternalServerError)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "tool_calls": pending })))
 }
 
 #[derive(Deserialize)]
@@ -605,7 +449,6 @@ async fn main() -> std::io::Result<()> {
     info!("Starting server on http://0.0.0.0:{}", port);
 
     let pool_data = web::Data::new(pool);
-    let sessions = web::Data::new(session_store());
     let event_tx_data = web::Data::new(event_tx);
 
     HttpServer::new(move || {
@@ -617,7 +460,6 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .app_data(pool_data.clone())
-            .app_data(sessions.clone())
             .app_data(event_tx_data.clone())
             .wrap(cors)
             .wrap(DefaultHeaders::new().add(("Cache-Control", "no-store")))
@@ -628,6 +470,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/chats", web::get().to(handle_list_chats))
             .route("/api/chats/{id}", web::delete().to(handle_delete_chat))
             .route("/api/chats/{id}/messages", web::get().to(handle_get_messages))
+            .route("/api/chats/{id}/pending-tools", web::get().to(handle_get_pending_tools))
             .route("/api/events", web::get().to(handle_events))
             .route("/api/write-file", web::post().to(handle_write_file))
             .route("/health", web::get().to(health))
