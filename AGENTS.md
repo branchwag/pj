@@ -43,6 +43,7 @@ src/
   tools.rs  — Tool definitions, execution, text-based tool call parsing
 static/     — Web UI frontend (HTML/JS/CSS)
   fonts/    — Bundled web fonts including local CJK coverage
+  vendor/   — Vendored marked.js + KaTeX for offline markdown/LaTeX rendering in chat messages
 data/       — SQLite database (chat.db)
 ```
 
